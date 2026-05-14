@@ -7,9 +7,10 @@
 // Snapshot bulk-memory compression for the Cloud Hypervisor backend.
 //
 // Cloud Hypervisor's /vm.snapshot writes a directory containing config.json,
-// state.json, and one or more memory-ranges-* blobs. The blobs hold the
-// guest's full RAM and dominate snapshot size — typically 200–4096 MiB,
-// versus ~10 KiB for the JSON files.
+// state.json, and a "memory-ranges" file (single contiguous blob in CLH
+// today; future versions may split into "memory-ranges-N"). The blob
+// holds the guest's full RAM and dominates snapshot size — typically
+// 200–4096 MiB, versus ~10 KiB for the JSON files.
 //
 // On a kata-clh sandbox with reclaim_guest_freed_memory + a 256 MiB floor,
 // the actual blob ranges from a few tens of MiB (idle pause) to a few
@@ -20,15 +21,15 @@
 // We don't ask Cloud Hypervisor to write or read a compressed file; CLH
 // only speaks file:// (raw bytes). Instead:
 //   1. After SnapshotVM completes, walk the destination dir and replace
-//      each memory-ranges-* file with <name>.zst, removing the original.
+//      each memory-ranges* file with <name>.zst, removing the original.
 //      Performed inline on the snapshot path.
 //   2. Before /vm.restore, if any .zst file is present, decompress every
 //      file (memory and JSON) into a sibling tmpdir and point CLH at the
 //      tmpdir as source_url. The tmpdir is cleaned up after restore.
 //
-// JSON files are not compressed (already tiny) but they are hardlinked into
-// the decompressed tmpdir so config.json rewriting + state.json access still
-// hit the same content.
+// JSON files are not compressed (already tiny) but they are *copied*
+// (not hardlinked) into the decompressed tmpdir so the per-restore
+// rewriteSnapshotConfigForNewSandbox edit stays local to this restore.
 
 package virtcontainers
 
@@ -55,10 +56,12 @@ const (
 	snapshotCompressedSuffix = ".zst"
 
 	// snapshotMemoryRangePrefix is the filename prefix Cloud Hypervisor
-	// uses for guest RAM blobs in a snapshot directory. Stable across CLH
-	// v25+ but may change in future major releases — single source of
-	// truth here.
-	snapshotMemoryRangePrefix = "memory-ranges-"
+	// uses for guest RAM blobs in a snapshot directory. CLH currently
+	// writes a single contiguous file named exactly "memory-ranges"
+	// (vmm/src/memory_manager.rs: SNAPSHOT_FILENAME). Future CLH
+	// versions may split into multiple "memory-ranges-N" blobs; the
+	// prefix-match here covers both forms.
+	snapshotMemoryRangePrefix = "memory-ranges"
 )
 
 // snapshotCompressionEnabled returns true when the configured compression

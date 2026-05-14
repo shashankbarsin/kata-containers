@@ -195,6 +195,47 @@ func TestDecompressMixedSnapshot(t *testing.T) {
 	assert.True(t, bytes.Equal(got1, rand1))
 }
 
+// TestCompressSingleFileCLHDefault — Cloud Hypervisor today writes a single
+// guest-RAM blob named exactly "memory-ranges" (no numeric suffix). The
+// compress + decompress paths must handle that filename specifically; this
+// is the regression test for the missed-prefix bug seen on the first live
+// snapshot run.
+func TestCompressSingleFileCLHDefault(t *testing.T) {
+	src := t.TempDir()
+
+	// Idle pause sandbox-shaped data: 4 MiB zeros + 64 KiB random.
+	zeros := make([]byte, 4*1024*1024)
+	rand1 := make([]byte, 64*1024)
+	_, err := rand.Read(rand1)
+	require.NoError(t, err)
+	full := append(append([]byte{}, zeros...), rand1...)
+
+	require.NoError(t, os.WriteFile(filepath.Join(src, "memory-ranges"), full, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "config.json"), []byte(`{}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "state.json"), []byte(`{}`), 0o600))
+
+	count, in, out, err := compressSnapshotMemory(src, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "single-file CLH default must be picked up")
+	assert.Equal(t, int64(len(full)), in)
+	assert.Less(t, out, in/2, "expected at least 2x compression on mostly-zero data")
+
+	// Raw memory-ranges removed, .zst written.
+	_, err = os.Stat(filepath.Join(src, "memory-ranges"))
+	assert.True(t, os.IsNotExist(err), "raw file must be gone after compress")
+	_, err = os.Stat(filepath.Join(src, "memory-ranges.zst"))
+	require.NoError(t, err)
+
+	// Round-trip through decompress.
+	tmp, err := decompressSnapshotForRestore(src)
+	require.NoError(t, err)
+	defer os.RemoveAll(tmp)
+
+	got, err := os.ReadFile(filepath.Join(tmp, "memory-ranges"))
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(got, full), "memory-ranges round-trip mismatch")
+}
+
 // TestResolveZstdLevel — verify the level mapping covers the documented range.
 func TestResolveZstdLevel(t *testing.T) {
 	// Just smoke-check that the function never panics and returns a level
