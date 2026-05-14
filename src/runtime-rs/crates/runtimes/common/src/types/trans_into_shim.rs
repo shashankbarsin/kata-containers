@@ -340,6 +340,7 @@ impl TryFrom<TaskResponse> for api::Empty {
             TaskResponse::ResumeContainer => Ok(api::Empty::new()),
             TaskResponse::ResizeProcessPTY => Ok(api::Empty::new()),
             TaskResponse::UpdateContainer => Ok(api::Empty::new()),
+            TaskResponse::CheckpointContainer => Ok(api::Empty::new()),
             _ => Err(anyhow!(Error::UnexpectedResponse(
                 from,
                 type_name::<Self>().to_string()

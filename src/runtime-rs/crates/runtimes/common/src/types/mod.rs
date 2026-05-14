@@ -47,6 +47,11 @@ pub enum TaskRequest {
     UpdateContainer(UpdateRequest),
     Pid,
     ConnectContainer(ContainerID),
+    // Containerd's per-container Checkpoint RPC. Kata snapshots are
+    // whole-pod-VM, so any Checkpoint call against a Kata shim captures
+    // the entire sandbox; only `path` is acted on. The container id is
+    // logged for traceability.
+    CheckpointContainer(CheckpointRequest),
 }
 
 /// TaskResponse: TaskResponse to shim
@@ -69,6 +74,17 @@ pub enum TaskResponse {
     UpdateContainer,
     Pid(PID),
     ConnectContainer(PID),
+    CheckpointContainer,
+}
+
+/// Subset of containerd's CheckpointTaskRequest the runtime acts on. `path`
+/// is the destination directory the shim writes the sandbox snapshot into;
+/// `container_id` is the requesting container (logged but not acted on,
+/// since Kata's snapshot is whole-pod-VM).
+#[derive(Clone, Debug)]
+pub struct CheckpointRequest {
+    pub container_id: String,
+    pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

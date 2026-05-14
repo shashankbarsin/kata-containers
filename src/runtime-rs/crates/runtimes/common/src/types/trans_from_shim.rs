@@ -5,8 +5,8 @@
 //
 
 use super::{
-    ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest, KillRequest,
-    ResizePTYRequest, SandboxConfig, SandboxID, SandboxNetworkEnv, SandboxRequest,
+    CheckpointRequest, ContainerConfig, ContainerID, ContainerProcess, ExecProcessRequest,
+    KillRequest, ResizePTYRequest, SandboxConfig, SandboxID, SandboxNetworkEnv, SandboxRequest,
     SandboxStatusRequest, ShutdownRequest, StopSandboxRequest, TaskRequest, UpdateRequest,
     DEFAULT_SHM_SIZE,
 };
@@ -280,6 +280,19 @@ impl TryFrom<api::ResumeRequest> for TaskRequest {
     type Error = anyhow::Error;
     fn try_from(from: api::ResumeRequest) -> Result<Self> {
         Ok(TaskRequest::ResumeContainer(ContainerID::new(&from.id)?))
+    }
+}
+
+// Containerd Checkpoint RPC. Only the id (for logging) and the destination
+// path are used; the per-container `options` any-proto is ignored because
+// Kata's snapshot is whole-pod-VM.
+impl TryFrom<api::CheckpointTaskRequest> for TaskRequest {
+    type Error = anyhow::Error;
+    fn try_from(from: api::CheckpointTaskRequest) -> Result<Self> {
+        Ok(TaskRequest::CheckpointContainer(CheckpointRequest {
+            container_id: from.id,
+            path: from.path,
+        }))
     }
 }
 

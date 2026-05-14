@@ -79,5 +79,9 @@ impl_service!(
     stats | api::StatsRequest | api::StatsResponse,
     connect | api::ConnectRequest | api::ConnectResponse,
     shutdown | api::ShutdownRequest | api::Empty,
-    close_io | api::CloseIORequest | api::Empty
+    close_io | api::CloseIORequest | api::Empty,
+    // Wire the Checkpoint RPC so containerd (or an external client
+    // addressing the shim socket directly) can trigger a whole-pod-VM
+    // snapshot.
+    checkpoint | api::CheckpointTaskRequest | api::Empty
 );

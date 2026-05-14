@@ -740,6 +740,27 @@ impl RuntimeHandlerManager {
                     .await
                     .context("connect")?,
             )),
+            // Containerd's per-container Checkpoint RPC. Kata snapshots are
+            // whole-pod-VM, so any Checkpoint call -- regardless of which
+            // container id requested it -- captures the entire sandbox.
+            // Repeated calls overwrite the same destination directory and
+            // are idempotent.
+            TaskRequest::CheckpointContainer(req) => {
+                if req.path.is_empty() {
+                    return Err(anyhow!("checkpoint path is required"));
+                }
+                info!(
+                    sl!(),
+                    "Checkpoint: capturing whole-pod VM snapshot";
+                    "container_id" => &req.container_id,
+                    "path" => &req.path,
+                );
+                sandbox
+                    .snapshot(&req.path)
+                    .await
+                    .context("sandbox snapshot")?;
+                Ok(TaskResponse::CheckpointContainer)
+            }
         }
     }
 }
