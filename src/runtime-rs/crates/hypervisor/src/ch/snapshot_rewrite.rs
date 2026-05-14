@@ -81,25 +81,20 @@ pub(crate) fn read_snapshot_net_ids(config_path: &Path) -> Result<Vec<SnapshotNe
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("snapshot config net[{i}] missing string `id`"))?
             .to_string();
-        // CLH expects `fds.len() == num_queues` at restore time. The snapshot
-        // serialises `fds: [-1]` as a placeholder regardless of how many
-        // queues the original device had, so reading `fds.len()` undercounts
-        // for multi-queue devices and the restore validation rejects with
-        // RestoreMissingRequiredNetId. Use `num_queues` as the source of
-        // truth, falling back to fds.len() for older snapshots that may
-        // not carry it.
-        let num_fds = if let Some(nq) = n.get("num_queues").and_then(|v| v.as_u64()) {
-            nq as usize
-        } else {
-            match n.get("fds") {
-                Some(serde_json::Value::Array(arr)) => arr.len(),
-                Some(serde_json::Value::Null) | None => 0,
-                Some(other) => {
-                    return Err(anyhow!(
-                        "snapshot config net[{i}] `fds` is not an array: {:?}",
-                        other
-                    ));
-                }
+        // CLH's RestoreConfig::validate compares the count of fds we pass on
+        // `--restore net_fds=[id@[..]]` against `expected_fds.len()` from the
+        // snapshot's saved net config (vmm/src/config.rs::RestoreConfig::validate
+        // in cloud-hypervisor). The snapshot serialises `fds: [-1, ..]` with
+        // one slot per original fd, so `fds.len()` is exactly the count CLH
+        // expects -- matches Go's clh.go::readSnapshotNetIDs.
+        let num_fds = match n.get("fds") {
+            Some(serde_json::Value::Array(arr)) => arr.len(),
+            Some(serde_json::Value::Null) | None => 0,
+            Some(other) => {
+                return Err(anyhow!(
+                    "snapshot config net[{i}] `fds` is not an array: {:?}",
+                    other
+                ));
             }
         };
         out.push(SnapshotNetId { id, num_fds });

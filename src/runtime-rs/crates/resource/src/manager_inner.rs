@@ -331,7 +331,7 @@ impl ResourceManagerInner {
         Ok(())
     }
 
-    pub async fn setup_after_start_vm(&mut self) -> Result<()> {
+    pub async fn setup_after_start_vm(&mut self, restore_from_snapshot: bool) -> Result<()> {
         self.cgroups_resource
             .setup_after_start_vm(self.hypervisor.as_ref())
             .await
@@ -345,7 +345,20 @@ impl ResourceManagerInner {
         }
 
         if let Some(network) = self.network.as_ref() {
-            self.apply_network_to_agent(network.as_ref()).await?;
+            // Sandbox snapshot/restore: the in-guest kata-agent already has
+            // interfaces/routes/neighbours configured from before the
+            // snapshot was taken. Re-issuing UpdateInterface fails because
+            // the new host tap has a fresh MAC the guest doesn't know about
+            // (and even if it matched, agent state is already populated).
+            // Skip the agent-push here; the guest will keep its pre-snapshot
+            // network identity, which is intentional for the POC.
+            if restore_from_snapshot {
+                info!(sl!(),
+                    "setup_after_start_vm: skipping apply_network_to_agent (restore mode)";
+                    "sandbox" => &self.sid);
+            } else {
+                self.apply_network_to_agent(network.as_ref()).await?;
+            }
         }
 
         if let Some(swap) = self.swap_resource.as_ref() {

@@ -113,8 +113,9 @@ impl ResourceManager {
 
     #[instrument]
     pub async fn setup_after_start_vm(&self) -> Result<()> {
+        let restore = self.is_restore_from_snapshot();
         let mut inner = self.inner.write().await;
-        inner.setup_after_start_vm().await
+        inner.setup_after_start_vm(restore).await
     }
 
     /// Poll the netns until interfaces exist, then configure the guest (Docker 26+).

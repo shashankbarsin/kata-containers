@@ -395,10 +395,26 @@ impl CloudHypervisorInner {
         if let Some(src) = &self.restore_src {
             let mut restore_val = format!("source_url=file://{src}");
             if !net_fds.is_empty() {
-                let entries: Vec<String> = net_fds
+                // CLH's RestoreConfig parses net_fds as Tuple<String, Vec<u64>>,
+                // i.e. `net_fds=[id1@[fd1,fd2,...],id2@[fd3,...]]`. We must
+                // group consecutive entries by id and emit one bracketed list
+                // per device. `finalize_restore_pending_devices` builds
+                // `restore_net_fds` so all fds for one device are contiguous,
+                // so a simple linear group-by is sufficient.
+                let mut grouped: Vec<(String, Vec<i32>)> = Vec::new();
+                for (i, (id, _)) in net_fds.iter().enumerate() {
+                    let child_fd = 3 + i as i32;
+                    match grouped.last_mut() {
+                        Some((last_id, fds)) if last_id == id => fds.push(child_fd),
+                        _ => grouped.push((id.clone(), vec![child_fd])),
+                    }
+                }
+                let entries: Vec<String> = grouped
                     .iter()
-                    .enumerate()
-                    .map(|(i, (id, _))| format!("{}@{}", id, 3 + i))
+                    .map(|(id, fds)| {
+                        let inner: Vec<String> = fds.iter().map(|f| f.to_string()).collect();
+                        format!("{}@[{}]", id, inner.join(","))
+                    })
                     .collect();
                 restore_val.push_str(",net_fds=[");
                 restore_val.push_str(&entries.join(","));
@@ -1378,11 +1394,19 @@ impl CloudHypervisorInner {
 // Log all output from the CH process until a shutdown signal is received.
 // When that happens, stop logging and wait for the child process to finish
 // before returning.
+//
+// Sandbox snapshot/restore: when `KATA_CH_STDERR_TEE_DIR` is set in the
+// environment, every CH stderr line is also appended to
+// `<dir>/clh-<pid>.stderr.log` verbatim (with newline). This is a
+// diagnostic aid for restore failures where CH dies before slog can flush
+// its forwarded copy. Unset / empty disables the tee entirely.
 async fn cloud_hypervisor_log_output(
     mut child: Child,
     mut shutdown: Receiver<bool>,
     exit_notify: mpsc::Sender<i32>,
 ) -> Result<()> {
+    let child_pid = child.id().unwrap_or(0);
+
     let stdout = child
         .stdout
         .as_mut()
@@ -1401,6 +1425,32 @@ async fn cloud_hypervisor_log_output(
     let stderr_reader = BufReader::new(stderr);
     let mut stderr_lines = stderr_reader.lines();
 
+    // Optional stderr tee (sync `std::fs::File`, opened in append mode so
+    // multiple writers can share a directory safely). Best-effort: failing
+    // to open the tee file just disables tee for this CH instance.
+    let mut stderr_tee: Option<std::fs::File> = match std::env::var("KATA_CH_STDERR_TEE_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = std::path::Path::new(&dir).join(format!("clh-{child_pid}.stderr.log"));
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => {
+                    info!(sl!(), "CH stderr tee enabled"; "path" => %path.display());
+                    Some(f)
+                }
+                Err(e) => {
+                    warn!(sl!(), "CH stderr tee open failed: {e}";
+                          "path" => %path.display());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -1410,6 +1460,11 @@ async fn cloud_hypervisor_log_output(
             stderr_line = poll_fn(|cx| Pin::new(&mut stderr_lines).poll_next_line(cx)) => {
                 match stderr_line {
                     Ok(Some(line)) => {
+                        if let Some(f) = stderr_tee.as_mut() {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{line}");
+                            let _ = f.flush();
+                        }
                         // Sandbox snapshot/restore: CLH `Fatal error:` lines from
                         // a failed --restore don't carry the WARN:/ERRO: prefix
                         // parse_ch_log_level expects; force-classify them so the
@@ -1467,9 +1522,20 @@ async fn cloud_hypervisor_log_output(
     // Note that this kills _and_ waits for the process!
     let _ = child.kill().await;
     if let Ok(status) = child.wait().await {
-        let code = status.code().unwrap_or(0);
-        warn!(sl!(), "CH process exited with code {code}");
-        let _ = exit_notify.try_send(code);
+        // AKS Pod Snapshot POC: distinguish clean exit from signal-kill in
+        // the log. ExitStatus::code() returns None on signal termination,
+        // and unwrap_or(0) was masking SIGKILL/SIGSEGV/etc. as "code 0".
+        use std::os::unix::process::ExitStatusExt;
+        let code = status.code();
+        let signal = status.signal();
+        let core = status.core_dumped();
+        warn!(sl!(), "CH process exited";
+              "pid" => child_pid,
+              "code" => code,
+              "signal" => signal,
+              "core_dumped" => core,
+              "status_debug" => format!("{status:?}"));
+        let _ = exit_notify.try_send(code.unwrap_or(0));
     }
 
     Ok(())
