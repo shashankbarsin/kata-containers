@@ -175,7 +175,23 @@ impl CgroupsResourceInner {
             };
 
             let tgid = get_tgid_from_pid(vcpu as i32).context("get tgid from vCPU thread")? as u64;
-            self.sandbox_cgroup
+            // AKS Pod Snapshot: in cgroup v2 / systemd, threaded-mode is
+            // unavailable, so we cannot move individual vCPU threads while
+            // leaving the hypervisor process in the overhead cgroup. The
+            // upstream behaviour here is to move the whole hypervisor
+            // process into the sandbox (pod) cgroup, which makes
+            // hypervisor memory allocations (memory hot-add, snapshot
+            // page walks) compete with the workload's pod memory limit
+            // and get OOM-killed under tight limits. When an overhead
+            // cgroup is configured, keep the hypervisor in the overhead
+            // cgroup instead so it has the headroom required for
+            // snapshot/restore.
+            let target = if let Some(overhead_cgroup) = self.overhead_cgroup.as_mut() {
+                overhead_cgroup.as_mut()
+            } else {
+                self.sandbox_cgroup.as_mut()
+            };
+            target
                 .add_proc(CgroupPid::from(tgid))
                 .with_context(|| format!("add vcpu tgid {tgid}"))?;
         }
