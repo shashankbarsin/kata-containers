@@ -86,6 +86,14 @@ pub struct CloudHypervisorInner {
     // the restore is a one-shot operation: once the VM is up the same
     // sandbox runs identically to a freshly booted one.
     pub(crate) restore_src: Option<String>,
+
+    // AKS Pod Snapshot POC (Phase C4.1): tap fds the next start_vm() should
+    // hand to cloud-hypervisor as inheritable file descriptors. Each entry
+    // is (net device id from the snapshot config, the tap File). At launch
+    // the launch code dup2()s each fd onto child slot 3+i and appends
+    // `,net_fds=[id1@3,id2@4,...]` to the `--restore` arg. The Vec is
+    // drained at launch time so it can only be consumed once.
+    pub(crate) restore_net_fds: Vec<(String, std::fs::File)>,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
@@ -130,6 +138,7 @@ impl CloudHypervisorInner {
             exit_notify,
 
             restore_src: None,
+            restore_net_fds: Vec::new(),
         }
     }
 

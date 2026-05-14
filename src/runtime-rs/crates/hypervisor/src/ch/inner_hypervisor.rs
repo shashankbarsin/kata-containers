@@ -45,8 +45,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::io::AsRawFd;use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
@@ -372,22 +371,81 @@ impl CloudHypervisorInner {
             cmd.args(["--seccomp", "false"]);
         }
 
-        // AKS Pod Snapshot POC (Phase C4): if prepare_for_restore() armed a
-        // snapshot source, append `--restore source_url=file://<dir>`. CLH
-        // does the CreateVM+BootVM dance internally as part of --restore so
-        // start_vm() also skips boot_vm() below.
+        // AKS Pod Snapshot POC (Phase C4 / C4.1): if prepare_for_restore()
+        // armed a snapshot source, append `--restore source_url=file://<dir>`.
+        // If set_restore_net_fds() armed per-device tap fds for this launch,
+        // also emit `,net_fds=[<id>@<fd>,...]` and arrange for each fd to
+        // land at child slots 3..n via a pre_exec dup2 closure. CLH inherits
+        // child fd 3 first, then 4, etc -- matching the order of the Vec.
+        // start_vm() also skips boot_vm() when restore_src is set because
+        // CLH does CreateVM+BootVM internally as part of --restore (see
+        // clh.go::launchClh comment block).
         //
-        // NOTE: this initial port emits the no-net-fd form of --restore; a
-        // follow-up will plumb the new sandbox's tap fds through Command's
-        // ExtraFiles / pre_exec dup2 and append `,net_fds=[id@fd,...]`. For
-        // snapshots with zero net devices the launch path is already
-        // exercisable end-to-end.
+        // We take ownership of restore_net_fds out of self here so each
+        // launch consumes them exactly once. The owning File handles stay
+        // alive in the local `net_fds` binding until after cmd.spawn(); they
+        // are then dropped at end of this method, closing the parent's
+        // copies. (The child already has its own copies post-fork.)
+        let net_fds: Vec<(String, std::fs::File)> = std::mem::take(&mut self.restore_net_fds);
+        let net_fd_raws: Vec<std::os::unix::io::RawFd> =
+            net_fds.iter().map(|(_, f)| f.as_raw_fd()).collect();
         if let Some(src) = &self.restore_src {
-            let restore_val = format!("source_url=file://{src}");
+            let mut restore_val = format!("source_url=file://{src}");
+            if !net_fds.is_empty() {
+                let entries: Vec<String> = net_fds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| format!("{}@{}", id, 3 + i))
+                    .collect();
+                restore_val.push_str(",net_fds=[");
+                restore_val.push_str(&entries.join(","));
+                restore_val.push(']');
+            }
             info!(sl!(), "cloud_hypervisor_launch: restore mode";
                   "sandbox" => &self.id,
                   "restore_arg" => &restore_val);
             cmd.args(["--restore", &restore_val]);
+        } else if !net_fds.is_empty() {
+            // Defensive: if a caller armed net fds without a snapshot src
+            // we have nowhere to plumb them. Surface that as an error rather
+            // than silently leaking the fds into a fresh boot.
+            return Err(anyhow!(
+                "set_restore_net_fds armed {} net fd(s) but no restore_src is set",
+                net_fds.len()
+            ));
+        }
+
+        // Stage the dup2() side of net-fd inheritance. We collect raw fds
+        // (Copy, so cheap to move into the closure) and dup2 them onto child
+        // fds starting at 3. dup2 clears CLOEXEC on the target as a side
+        // effect; if the source fd already happens to live at the target
+        // slot we still need to clear CLOEXEC explicitly. The closure runs
+        // post-fork pre-exec in the child, so failures must surface through
+        // io::Error.
+        if !net_fd_raws.is_empty() {
+            let raws = net_fd_raws.clone();
+            // Safety: pre_exec runs after fork in the child; libc calls here
+            // touch only the child's fd table.
+            unsafe {
+                let _ = cmd.pre_exec(move || {
+                    for (idx, &fd) in raws.iter().enumerate() {
+                        let target: std::os::unix::io::RawFd = 3 + idx as i32;
+                        if fd != target {
+                            if libc::dup2(fd, target) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        let flags = libc::fcntl(target, libc::F_GETFD);
+                        if flags < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
         }
 
         let netns = self.netns.clone();
@@ -446,6 +504,12 @@ impl CloudHypervisorInner {
         debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
 
         let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
+
+        // AKS Pod Snapshot POC (Phase C4.1): the child has now forked and is
+        // headed for exec(); the parent's copies of the tap fds are no
+        // longer needed (the child has its own copies under fds 3+). Drop
+        // the Vec here to close them promptly rather than at end-of-scope.
+        drop(net_fds);
 
         // Save process PID
         self.pid = child.id();
@@ -786,6 +850,23 @@ impl CloudHypervisorInner {
               "sandbox" => &self.id,
               "snapshot_src" => snapshot_src);
         self.restore_src = Some(snapshot_src.to_string());
+        Ok(())
+    }
+
+    // AKS Pod Snapshot POC (Phase C4.1): stash per-net-device tap fds the
+    // next launch should hand to cloud-hypervisor as inheritable child fds.
+    // The caller is responsible for matching its sandbox's prepared taps
+    // (one File per net device id) to the IDs declared in the snapshot's
+    // config.json, and for opening those taps inside the destination netns.
+    // The Vec is drained at launch time; passing an empty Vec disarms.
+    pub(crate) async fn set_restore_net_fds(
+        &mut self,
+        net_fds: Vec<(String, std::fs::File)>,
+    ) -> Result<()> {
+        info!(sl!(), "set_restore_net_fds: arming";
+              "sandbox" => &self.id,
+              "net_fd_count" => net_fds.len());
+        self.restore_net_fds = net_fds;
         Ok(())
     }
 

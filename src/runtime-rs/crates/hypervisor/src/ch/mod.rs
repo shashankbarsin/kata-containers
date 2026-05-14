@@ -50,6 +50,20 @@ impl CloudHypervisor {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
+
+    // AKS Pod Snapshot POC (Phase C4.1): arm the next launch with per-net-
+    // device tap fds the child should inherit at slots 3+. Kept as a
+    // concrete-type method rather than a trait method because tap fds are
+    // CLH-specific and the eventual caller (restore orchestrator) is
+    // already CLH-aware. Passing an empty Vec disarms any previously armed
+    // fds.
+    pub async fn set_restore_net_fds(
+        &self,
+        net_fds: Vec<(String, std::fs::File)>,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.set_restore_net_fds(net_fds).await
+    }
 }
 
 impl Default for CloudHypervisor {
