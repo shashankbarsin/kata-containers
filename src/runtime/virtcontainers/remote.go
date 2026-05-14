@@ -197,6 +197,10 @@ func (rh *remoteHypervisor) SaveVM() error {
 	return notImplemented("SaveVM")
 }
 
+func (rh *remoteHypervisor) SnapshotVM(ctx context.Context, destDir string) error {
+	return notImplemented("SnapshotVM")
+}
+
 func (rh *remoteHypervisor) ResumeVM(ctx context.Context) error {
 	return notImplemented("ResumeVM")
 }

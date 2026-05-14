@@ -828,6 +828,20 @@ type HypervisorConfig struct {
 	// BootFromTemplate used to indicate if the VM should be created from a template VM
 	BootFromTemplate bool
 
+	// RestoreFromSnapshot indicates that the VM should be restored from a previously
+	// taken sandbox-level snapshot at SnapshotPath instead of being booted normally.
+	// This is independent of the templating flow (BootFromTemplate) which uses
+	// shared-memory cloning for fast cold starts; RestoreFromSnapshot performs a
+	// per-pod restore from a CRIU-style snapshot directory and is what powers the
+	// AKS Pod Snapshot feature.
+	RestoreFromSnapshot bool
+
+	// SnapshotPath is the directory holding the snapshot artifacts written by
+	// SnapshotVM and consumed by the restore flow when RestoreFromSnapshot is true.
+	// For the Cloud Hypervisor backend this corresponds to the URL passed to
+	// /vm.snapshot (DestinationUrl) and /vm.restore (SourceUrl) as `file://<path>`.
+	SnapshotPath string
+
 	// DisableVhostNet is used to indicate if host supports vhost_net
 	DisableVhostNet bool
 
@@ -1304,6 +1318,13 @@ type Hypervisor interface {
 	PauseVM(ctx context.Context) error
 	SaveVM() error
 	ResumeVM(ctx context.Context) error
+	// SnapshotVM persists the running VM's full state (memory + device state)
+	// into destDir. Unlike SaveVM (which is used by the templating factory and
+	// derives its destination from HypervisorConfig.MemoryPath), SnapshotVM
+	// takes an explicit directory and is the per-pod sandbox-snapshot primitive
+	// that powers the AKS Pod Snapshot feature. Backends that don't implement
+	// per-pod snapshot return an error.
+	SnapshotVM(ctx context.Context, destDir string) error
 	AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error
 	HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
 	HotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)

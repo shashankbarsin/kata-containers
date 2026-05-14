@@ -2440,6 +2440,27 @@ func (q *qemu) SaveVM() error {
 	return q.waitMigration()
 }
 
+// SnapshotVM is the sandbox-level snapshot primitive for the qemu backend.
+// QEMU's existing SaveVM derives the destination path from
+// HypervisorConfig.DevicesStatePath; SnapshotVM lets the caller pass an
+// explicit directory (used by the AKS sandbox-snapshot flow). The state file
+// is written to <destDir>/state and the running VM is left paused on success
+// (the caller is responsible for resuming).
+func (q *qemu) SnapshotVM(ctx context.Context, destDir string) error {
+	if destDir == "" {
+		return fmt.Errorf("SnapshotVM: destDir is required")
+	}
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return fmt.Errorf("creating snapshot destination %q: %w", destDir, err)
+	}
+
+	prev := q.config.DevicesStatePath
+	q.config.DevicesStatePath = filepath.Join(destDir, "state")
+	defer func() { q.config.DevicesStatePath = prev }()
+
+	return q.SaveVM()
+}
+
 func (q *qemu) waitMigration() error {
 	t := time.NewTimer(qmpMigrationWaitTimeout)
 	defer t.Stop()

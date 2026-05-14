@@ -85,6 +85,11 @@ type VCSandbox interface {
 	GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error)
 	SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error
 	SetPolicy(ctx context.Context, policy string) error
+
+	// Snapshot is the AKS Pod Snapshot capture entry point. It captures the
+	// running sandbox VM's full state into destDir (memory + device state +
+	// kata-snapshot.json sidecar) and resumes the sandbox on success.
+	Snapshot(ctx context.Context, destDir string) error
 }
 
 // VCContainer is the Container interface

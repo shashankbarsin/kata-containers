@@ -1115,6 +1115,10 @@ func (s *stratovirt) SaveVM() error {
 	return nil
 }
 
+func (s *stratovirt) SnapshotVM(ctx context.Context, destDir string) error {
+	return fmt.Errorf("stratovirt: SnapshotVM not implemented")
+}
+
 func (s *stratovirt) ResumeVM(ctx context.Context) error {
 	return nil
 }

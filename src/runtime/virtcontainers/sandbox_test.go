@@ -1679,3 +1679,49 @@ func TestSandboxHugepageLimit(t *testing.T) {
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
 }
+
+// TestSandboxSnapshotWritesManifest covers Phase 1 of the AKS Pod Snapshot POC:
+// Sandbox.Snapshot must (1) call the hypervisor's snapshot path against the
+// requested directory, (2) drop a kata-snapshot.json sidecar so restore can
+// validate the source, and (3) leave the sandbox runnable (mockHypervisor's
+// Pause/Resume are no-ops).
+func TestSandboxSnapshotWritesManifest(t *testing.T) {
+	assert := assert.New(t)
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "snap")
+
+	s := &Sandbox{
+		id:         "test-sandbox-snapshot",
+		hypervisor: &mockHypervisor{},
+		ctx:        context.Background(),
+		config: &SandboxConfig{
+			HypervisorType: MockHypervisor,
+		},
+		containers: map[string]*Container{
+			"c1": {id: "c1"},
+		},
+	}
+
+	assert.NoError(s.Snapshot(context.Background(), dest))
+
+	// Sidecar manifest must be present and parseable.
+	m, err := LoadSnapshotManifest(dest)
+	assert.NoError(err)
+	assert.Equal(SnapshotManifestVersion, m.Version)
+	assert.Equal("test-sandbox-snapshot", m.SandboxID)
+	assert.Equal(string(MockHypervisor), m.HypervisorTyp)
+	assert.Contains(m.ContainerIDs, "c1")
+}
+
+func TestSandboxSnapshotRejectsEmptyDest(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{hypervisor: &mockHypervisor{}, config: &SandboxConfig{}, ctx: context.Background()}
+	err := s.Snapshot(context.Background(), "")
+	assert.Error(err)
+}
+
+func TestLoadSnapshotManifestRejectsMissing(t *testing.T) {
+	assert := assert.New(t)
+	_, err := LoadSnapshotManifest(t.TempDir())
+	assert.Error(err)
+}

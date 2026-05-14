@@ -905,6 +905,10 @@ func (fc *firecracker) SaveVM() error {
 	return nil
 }
 
+func (fc *firecracker) SnapshotVM(ctx context.Context, destDir string) error {
+	return fmt.Errorf("firecracker: SnapshotVM not implemented")
+}
+
 func (fc *firecracker) ResumeVM(ctx context.Context) error {
 	return nil
 }

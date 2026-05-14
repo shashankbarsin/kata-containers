@@ -64,6 +64,10 @@ func (m *mockHypervisor) SaveVM() error {
 	return nil
 }
 
+func (m *mockHypervisor) SnapshotVM(ctx context.Context, destDir string) error {
+	return nil
+}
+
 func (m *mockHypervisor) AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error {
 	return nil
 }

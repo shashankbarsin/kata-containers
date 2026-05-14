@@ -11,6 +11,7 @@ package virtcontainers
 
 import (
 	"context"
+	"fmt"
 
 	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
@@ -40,6 +41,10 @@ func (vfw *virtFramework) PauseVM(ctx context.Context) error {
 
 func (vfw *virtFramework) SaveVM() error {
 	return nil
+}
+
+func (vfw *virtFramework) SnapshotVM(ctx context.Context, destDir string) error {
+	return fmt.Errorf("virtframework: SnapshotVM not implemented")
 }
 
 func (vfw *virtFramework) ResumeVM(ctx context.Context) error {

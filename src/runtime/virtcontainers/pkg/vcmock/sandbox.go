@@ -277,3 +277,8 @@ func (s *Sandbox) SetIPTables(ctx context.Context, isIPv6 bool, data []byte) err
 func (s *Sandbox) SetPolicy(ctx context.Context, policy string) error {
 	return nil
 }
+
+// Snapshot implements the VCSandbox interface of the same name.
+func (s *Sandbox) Snapshot(ctx context.Context, destDir string) error {
+	return nil
+}

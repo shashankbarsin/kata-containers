@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -1967,6 +1968,108 @@ func (s *Sandbox) ResumeContainer(ctx context.Context, containerID string) error
 		return err
 	}
 	return nil
+}
+
+// SnapshotManifestVersion is the schema version written into kata-snapshot.json
+// alongside the hypervisor's binary state files. Bump on incompatible changes.
+const SnapshotManifestVersion = 1
+
+// SnapshotManifestFile is the well-known filename of the sidecar manifest that
+// marks a directory as a Kata sandbox snapshot.
+const SnapshotManifestFile = "kata-snapshot.json"
+
+// SnapshotManifest is the on-disk sidecar written by Sandbox.Snapshot. It lets
+// the restore path validate that a directory is a Kata snapshot (vs an
+// unrelated directory) and capture enough origin metadata to be useful for
+// debugging and future cross-node restore.
+type SnapshotManifest struct {
+	Version       int       `json:"version"`
+	SandboxID     string    `json:"sandboxID"`
+	HypervisorTyp string    `json:"hypervisorType"`
+	CreatedAt     time.Time `json:"createdAt"`
+	// ContainerIDs lists all containers running inside the sandbox at snapshot
+	// time. The restore path can warn if the new pod's container set differs.
+	ContainerIDs []string `json:"containerIDs,omitempty"`
+}
+
+// Snapshot captures the running sandbox's full VM state into destDir. The
+// flow follows GKE Pod Snapshots with postCheckpoint=resume semantics:
+// Pause → SnapshotVM → Resume. The original sandbox keeps running on success.
+//
+// destDir is created if it doesn't exist. After a successful return it
+// contains: the hypervisor's snapshot artifacts (CLH writes config.json,
+// state.json, memory-ranges-*) plus a kata-snapshot.json sidecar.
+func (s *Sandbox) Snapshot(ctx context.Context, destDir string) error {
+	if destDir == "" {
+		return fmt.Errorf("Sandbox.Snapshot: destDir is required")
+	}
+
+	s.Logger().WithField("destDir", destDir).Info("Snapshotting sandbox")
+
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return fmt.Errorf("creating snapshot destination %q: %w", destDir, err)
+	}
+
+	// Pause the VM (freezes every container inside it as a side effect).
+	if err := s.hypervisor.PauseVM(ctx); err != nil {
+		return fmt.Errorf("pausing VM for snapshot: %w", err)
+	}
+
+	// Best-effort resume on every exit path so a failed snapshot doesn't leave
+	// the sandbox stuck in a paused state.
+	defer func() {
+		if rerr := s.hypervisor.ResumeVM(ctx); rerr != nil {
+			s.Logger().WithError(rerr).Warn("failed to resume VM after snapshot")
+		}
+	}()
+
+	if err := s.hypervisor.SnapshotVM(ctx, destDir); err != nil {
+		return fmt.Errorf("snapshotting VM: %w", err)
+	}
+
+	// Write the sidecar manifest last so its presence implies the snapshot
+	// directory is complete and consumable by restore.
+	manifest := SnapshotManifest{
+		Version:       SnapshotManifestVersion,
+		SandboxID:     s.id,
+		HypervisorTyp: string(s.config.HypervisorType),
+		CreatedAt:     time.Now().UTC(),
+		ContainerIDs:  make([]string, 0, len(s.containers)),
+	}
+	for cid := range s.containers {
+		manifest.ContainerIDs = append(manifest.ContainerIDs, cid)
+	}
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling snapshot manifest: %w", err)
+	}
+	manifestPath := filepath.Join(destDir, SnapshotManifestFile)
+	if err := os.WriteFile(manifestPath, manifestBytes, 0o600); err != nil {
+		return fmt.Errorf("writing snapshot manifest %q: %w", manifestPath, err)
+	}
+
+	s.Logger().WithField("destDir", destDir).Info("Sandbox snapshot complete")
+	return nil
+}
+
+// LoadSnapshotManifest reads and validates the kata-snapshot.json sidecar from
+// srcDir. It is used by the restore path (containerd-shim Create) to verify
+// the directory passed via OCI annotation is a real Kata snapshot before
+// pointing the hypervisor at it.
+func LoadSnapshotManifest(srcDir string) (*SnapshotManifest, error) {
+	path := filepath.Join(srcDir, SnapshotManifestFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading snapshot manifest %q: %w", path, err)
+	}
+	var m SnapshotManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parsing snapshot manifest %q: %w", path, err)
+	}
+	if m.Version != SnapshotManifestVersion {
+		return nil, fmt.Errorf("unsupported snapshot manifest version %d (this build supports %d)", m.Version, SnapshotManifestVersion)
+	}
+	return &m, nil
 }
 
 // createContainers registers all containers, create the
