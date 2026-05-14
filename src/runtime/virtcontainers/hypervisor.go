@@ -853,6 +853,24 @@ type HypervisorConfig struct {
 	// /vm.snapshot (DestinationUrl) and /vm.restore (SourceUrl) as `file://<path>`.
 	SnapshotPath string
 
+	// SnapshotCompression controls how the bulk memory blobs in a sandbox
+	// snapshot are stored on disk. Valid values:
+	//   ""      — no compression (CLH writes memory-ranges-* as raw)
+	//   "none"  — alias for ""
+	//   "zstd"  — compress memory-ranges-* with zstd after SnapshotVM and
+	//             decompress them to a tmpdir before /vm.restore. Typical
+	//             ratio on guest RAM is 2-3x with level 3.
+	// Compression dramatically reduces the on-disk and over-network size of a
+	// snapshot but costs CPU time on snapshot and restore. The Cloud Hypervisor
+	// backend honours this field; other backends ignore it.
+	SnapshotCompression string
+
+	// SnapshotCompressionLevel is the zstd level used when
+	// SnapshotCompression == "zstd". Valid range 1..22; 0 means "use the
+	// implementation default" (3, the SpeedDefault preset). Lower levels
+	// trade compression ratio for snapshot/restore latency.
+	SnapshotCompressionLevel int
+
 	// DisableVhostNet is used to indicate if host supports vhost_net
 	DisableVhostNet bool
 

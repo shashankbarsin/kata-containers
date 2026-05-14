@@ -154,6 +154,8 @@ type hypervisor struct {
 	MemPrealloc                    bool                      `toml:"enable_mem_prealloc"`
 	ReclaimGuestFreedMemory        bool                      `toml:"reclaim_guest_freed_memory"`
 	EnableMergeable                bool                      `toml:"enable_mergeable"`
+	SnapshotCompression            string                    `toml:"snapshot_compression"`
+	SnapshotCompressionLevel       int                       `toml:"snapshot_compression_level"`
 	HugePages                      bool                      `toml:"enable_hugepages"`
 	VirtioMem                      bool                      `toml:"enable_virtio_mem"`
 	IOMMU                          bool                      `toml:"enable_iommu"`
@@ -1210,6 +1212,8 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MemPrealloc:                    h.MemPrealloc,
 		ReclaimGuestFreedMemory:        h.ReclaimGuestFreedMemory,
 		EnableMergeable:                h.EnableMergeable,
+		SnapshotCompression:            h.SnapshotCompression,
+		SnapshotCompressionLevel:       h.SnapshotCompressionLevel,
 		HugePages:                      h.HugePages,
 		FileBackedMemRootDir:           h.FileBackedMemRootDir,
 		FileBackedMemRootList:          h.FileBackedMemRootList,
@@ -1600,6 +1604,8 @@ func GetDefaultHypervisorConfig() vc.HypervisorConfig {
 		MemPrealloc:              defaultEnableMemPrealloc,
 		ReclaimGuestFreedMemory:  defaultEnableReclaimGuestFreedMemory,
 		EnableMergeable:          defaultEnableMergeable,
+		SnapshotCompression:      defaultSnapshotCompression,
+		SnapshotCompressionLevel: defaultSnapshotCompressionLevel,
 		HugePages:                defaultEnableHugePages,
 		IOMMU:                    defaultEnableIOMMU,
 		IOMMUPlatform:            defaultEnableIOMMUPlatform,

@@ -34,6 +34,7 @@ require (
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9
+	github.com/klauspost/compress v1.18.0
 	github.com/mdlayher/vsock v1.2.1
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/moby/sys/userns v0.1.0
@@ -105,7 +106,6 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/intel/goresctrl v0.8.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect

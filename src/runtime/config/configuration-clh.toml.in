@@ -221,6 +221,35 @@ reclaim_guest_freed_memory = false
 # Default false
 enable_mergeable = false
 
+# Compression mode for sandbox snapshot bulk memory.
+#
+# When a Cloud Hypervisor snapshot is taken (Sandbox.Snapshot via the shim
+# Checkpoint RPC), CLH writes config.json + state.json + one or more
+# memory-ranges-* blobs into the snapshot directory. The blobs hold the
+# guest's full RAM and dominate snapshot size — typically 200-4096 MiB
+# versus ~10 KiB for the JSON files.
+#
+# Setting this to "zstd" makes kata-runtime stream every memory-ranges-*
+# blob through a zstd encoder right after CLH finishes the snapshot,
+# replacing each with a <name>.zst on disk. Restore detects the .zst
+# extension, decompresses into a sibling tmp directory, and points
+# /vm.restore at the tmp dir. JSON files are copied (not compressed) so
+# config.json rewriting on restore stays local to the new sandbox.
+#
+# Typical ratio on idle sandbox RAM: 2-3x with zstd level 3 (the default
+# when level is 0). CPU cost: ~250 MB/s encode and ~1 GB/s decode on a
+# modern x86 host, both single-threaded.
+#
+# Valid values: "" (off), "none" (off), "zstd" (compress).
+# Default: ""
+snapshot_compression = ""
+
+# zstd level used when snapshot_compression = "zstd". 0 means "use the
+# implementation default" (3, the SpeedDefault preset). Lower levels are
+# faster but compress less; higher levels slow down snapshot but produce
+# smaller files. Range: 0..22.
+snapshot_compression_level = 0
+
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory
 # being allocated using huge pages.

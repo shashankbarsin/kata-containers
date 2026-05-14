@@ -302,6 +302,12 @@ type cloudHypervisor struct {
 	config          HypervisorConfig
 	stopped         int32
 	mu              sync.Mutex
+
+	// restoreTmpDir is set when buildRestoreArgs decompresses a
+	// zstd-compressed snapshot into a sibling tmp directory. CLH reads
+	// from this dir for /vm.restore. Cleaned up on stopSandbox so
+	// repeated restore-from-the-same-snapshot flows do not leak disk.
+	restoreTmpDir string
 }
 
 var clhKernelParams = []Param{
@@ -1422,6 +1428,12 @@ func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {
 // SnapshotVM mutates clh.config.SnapshotPath so that SaveVM (which the rest of
 // the runtime calls) writes to the per-pod destination, then restores it on
 // exit so subsequent templating-style flows are not affected.
+//
+// When clh.config.SnapshotCompression is set ("zstd"), the bulk
+// memory-ranges-* blobs are compressed in place after CLH finishes writing.
+// JSON files are left untouched. Compression is best-effort: a failure logs
+// a warning and leaves the raw snapshot intact rather than failing the
+// snapshot RPC.
 func (clh *cloudHypervisor) SnapshotVM(ctx context.Context, destDir string) error {
 	if destDir == "" {
 		return fmt.Errorf("SnapshotVM: destDir is required")
@@ -1431,7 +1443,34 @@ func (clh *cloudHypervisor) SnapshotVM(ctx context.Context, destDir string) erro
 	clh.config.SnapshotPath = destDir
 	defer func() { clh.config.SnapshotPath = prev }()
 
-	return clh.SaveVM()
+	if err := clh.SaveVM(); err != nil {
+		return err
+	}
+
+	if snapshotCompressionEnabled(clh.config.SnapshotCompression) {
+		count, in, out, err := compressSnapshotMemory(destDir, clh.config.SnapshotCompressionLevel)
+		if err != nil {
+			// Compression failure is not fatal — the raw snapshot is
+			// still usable. Surface the error in the log so operators
+			// know to investigate, but keep the snapshot.
+			clh.Logger().WithError(err).WithField("snapshot_dir", destDir).
+				Warn("snapshot bulk-memory compression failed; snapshot retained uncompressed")
+			return nil
+		}
+		if count > 0 {
+			ratio := float64(in) / float64(out)
+			clh.Logger().WithFields(map[string]interface{}{
+				"snapshot_dir":  destDir,
+				"files":         count,
+				"bytes_raw":     in,
+				"bytes_zstd":    out,
+				"zstd_level":    clh.config.SnapshotCompressionLevel,
+				"ratio":         fmt.Sprintf("%.2fx", ratio),
+				"saved_bytes":   in - out,
+			}).Info("Compressed snapshot bulk memory with zstd")
+		}
+	}
+	return nil
 }
 
 // snapshotDestinationDir returns the on-disk directory used as both the
@@ -1479,17 +1518,41 @@ func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
 //
 // Steps:
 //  1. Validate the snapshot dir + state.json + config.json.
-//  2. Rewrite the snapshot config so absolute paths to per-sandbox sockets
+//  2. If the snapshot was written compressed (memory-ranges-*.zst), stream
+//     it into a sibling tmpdir of decompressed blobs and copies of the JSON
+//     metadata; CLH /vm.restore will be pointed at the tmpdir. The tmpdir
+//     is tracked on clh.restoreTmpDir for cleanup at stopSandbox time.
+//  3. Rewrite the snapshot config so absolute paths to per-sandbox sockets
 //     point at the new sandbox-id (CLH's restore code path opens these).
-//  3. Read the snapshot's net device IDs in declaration order.
-//  4. Match them up with this sandbox's already-prepared tap fds.
-//  5. Emit `--restore source_url=file://...` plus one `--net id=,fd=` per
+//  4. Read the snapshot's net device IDs in declaration order.
+//  5. Match them up with this sandbox's already-prepared tap fds.
+//  6. Emit `--restore source_url=file://...` plus one `--net id=,fd=` per
 //     device, with fd numbers starting at 3.
 func (clh *cloudHypervisor) buildRestoreArgs() ([]string, []*os.File, error) {
-	src, err := clh.snapshotDestinationDir()
+	canonicalSrc, err := clh.snapshotDestinationDir()
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Determine the on-disk directory CLH will actually read from. If the
+	// snapshot is compressed we materialise a tmpdir of raw blobs +
+	// JSON copies; otherwise CLH reads the canonical dir directly.
+	src := canonicalSrc
+	if compressed, cerr := snapshotIsCompressed(canonicalSrc); cerr != nil {
+		return nil, nil, fmt.Errorf("probing snapshot compression: %w", cerr)
+	} else if compressed {
+		tmpDir, derr := decompressSnapshotForRestore(canonicalSrc)
+		if derr != nil {
+			return nil, nil, fmt.Errorf("decompressing snapshot for restore: %w", derr)
+		}
+		clh.Logger().WithFields(map[string]interface{}{
+			"snapshot_src": canonicalSrc,
+			"restore_src":  tmpDir,
+		}).Info("Decompressed zstd snapshot into tmpdir for /vm.restore")
+		clh.restoreTmpDir = tmpDir
+		src = tmpDir
+	}
+
 	for _, fname := range []string{"state.json", "config.json"} {
 		fp := filepath.Join(src, fname)
 		if _, err := os.Stat(fp); err != nil {
@@ -2292,6 +2355,18 @@ func (clh *cloudHypervisor) cleanupVM(force bool) error {
 	}
 
 	clh.Logger().Debug("removing vm sockets")
+
+	// Remove the per-restore decompress tmpdir, if any. This was created
+	// in buildRestoreArgs to materialise zstd-compressed snapshot blobs
+	// for CLH; the canonical (compressed) snapshot dir lives elsewhere
+	// and is not touched here.
+	if clh.restoreTmpDir != "" {
+		if err := os.RemoveAll(clh.restoreTmpDir); err != nil {
+			clh.Logger().WithError(err).WithField("path", clh.restoreTmpDir).
+				Warn("removing restore decompress tmpdir failed")
+		}
+		clh.restoreTmpDir = ""
+	}
 
 	path, err := clh.vsockSocketPath(clh.id)
 	if err == nil {
