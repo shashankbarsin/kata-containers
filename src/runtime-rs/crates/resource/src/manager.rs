@@ -5,6 +5,7 @@
 //
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent::{Agent, Storage};
@@ -36,6 +37,16 @@ pub struct ManagerArgs {
 
 pub struct ResourceManager {
     inner: Arc<RwLock<ResourceManagerInner>>,
+    /// Sandbox snapshot/restore: when true, the sandbox was created via the
+    /// hypervisor's restore-from-snapshot path. The in-guest kata-agent
+    /// already received CreateSandbox + the per-container CreateContainer +
+    /// StartContainer calls before the snapshot was taken, and CPUs/memory
+    /// are already online inside the guest. Re-issuing those grpcs (or the
+    /// online_cpu_mem / hypervisor resize calls inside
+    /// update_linux_resource) races the agent's pre-existing state and
+    /// hangs (DeadlineExceeded). Callers consult this flag to short-circuit.
+    /// Set once via set_restore_from_snapshot during VirtSandbox::start.
+    restore_from_snapshot: AtomicBool,
 }
 
 impl std::fmt::Debug for ResourceManager {
@@ -60,7 +71,23 @@ impl ResourceManager {
                 ResourceManagerInner::new(sid, agent, hypervisor, toml_config, init_size_manager)
                     .await?,
             )),
+            restore_from_snapshot: AtomicBool::new(false),
         })
+    }
+
+    /// Sandbox snapshot/restore: arm the per-sandbox restore-mode flag.
+    /// VirtSandbox::start calls this when the create OCI spec carries the
+    /// podsnapshot.aks.io/restore-from-path annotation, before any agent
+    /// grpcs are issued.
+    pub fn set_restore_from_snapshot(&self, on: bool) {
+        self.restore_from_snapshot.store(on, Ordering::Relaxed);
+    }
+
+    /// Returns true if this sandbox was created via the
+    /// hypervisor's restore-from-snapshot path. See the field doc on
+    /// `restore_from_snapshot` for the gating rationale.
+    pub fn is_restore_from_snapshot(&self) -> bool {
+        self.restore_from_snapshot.load(Ordering::Relaxed)
     }
 
     pub async fn config(&self) -> Arc<TomlConfig> {
@@ -215,6 +242,16 @@ impl ResourceManager {
         linux_resources: Option<&LinuxResources>,
         op: ResourceUpdateOp,
     ) -> Result<Option<LinuxResources>> {
+        // Sandbox snapshot/restore: in restore mode the VM was checkpointed
+        // with its CPUs and memory already provisioned and online inside the
+        // guest. Issuing resize/online requests against the new VM (or its
+        // agent) races with that pre-existing state and hangs the agent
+        // (e.g. OnlineCPUMemRequest timed out). Skip resource updates
+        // entirely; pass the inputs through unchanged for the caller's spec
+        // bookkeeping.
+        if self.is_restore_from_snapshot() {
+            return Ok(linux_resources.cloned());
+        }
         let inner = self.inner.read().await;
         inner.update_linux_resource(cid, linux_resources, op).await
     }
@@ -244,6 +281,7 @@ impl Persist for ResourceManager {
         let inner = ResourceManagerInner::restore(resource_args, resource_state).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
+            restore_from_snapshot: AtomicBool::new(false),
         })
     }
 }

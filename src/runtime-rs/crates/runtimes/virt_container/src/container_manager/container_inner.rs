@@ -138,17 +138,31 @@ impl ContainerInner {
         }
     }
 
-    pub(crate) async fn start_container(&mut self, cid: &ContainerID) -> Result<()> {
+    pub(crate) async fn start_container(
+        &mut self,
+        cid: &ContainerID,
+        restore_mode: bool,
+    ) -> Result<()> {
         self.check_state(vec![ProcessStatus::Created, ProcessStatus::Stopped])
             .await
             .context("check state")?;
 
-        self.agent
-            .start_container(agent::ContainerID {
-                container_id: cid.container_id.clone(),
-            })
-            .await
-            .context("start container")?;
+        // Sandbox snapshot/restore: in restore mode the container is
+        // already running inside the guest (captured in the snapshot).
+        // Skip the StartContainerRequest grpc; still flip local state to
+        // Running so the shim's bookkeeping matches reality.
+        if restore_mode {
+            info!(sl!(),
+                "start_container: short-circuited (restore mode)";
+                "container" => &cid.container_id);
+        } else {
+            self.agent
+                .start_container(agent::ContainerID {
+                    container_id: cid.container_id.clone(),
+                })
+                .await
+                .context("start container")?;
+        }
 
         self.set_state(ProcessStatus::Running).await;
 

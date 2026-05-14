@@ -769,6 +769,12 @@ impl Sandbox for VirtSandbox {
                 .prepare_for_restore(snapshot_src)
                 .await
                 .context("prepare hypervisor for restore")?;
+            // Arm the sandbox-wide restore flag before any agent grpcs are
+            // issued. Container-level call sites consult this via
+            // ResourceManager::is_restore_from_snapshot to short-circuit
+            // create_container / start_container, and update_linux_resource
+            // skips its hypervisor resize + agent online_cpu_mem hops.
+            self.resource_manager.set_restore_from_snapshot(true);
         }
 
         // generate device and setup before start vm
@@ -870,10 +876,20 @@ impl Sandbox for VirtSandbox {
             kernel_modules,
         };
 
-        self.agent
-            .create_sandbox(req)
-            .await
-            .context("create sandbox")?;
+        // Sandbox snapshot/restore: in restore mode the in-guest kata-agent
+        // already received CreateSandbox before the snapshot was taken.
+        // Re-issuing it would race with the agent's existing state and
+        // hangs (DeadlineExceeded). The req above is still built so the
+        // log line below records what would have been sent.
+        if self.resource_manager.is_restore_from_snapshot() {
+            info!(sl!(), "create_sandbox: short-circuited (restore mode)";
+                  "sandbox" => id);
+        } else {
+            self.agent
+                .create_sandbox(req)
+                .await
+                .context("create sandbox")?;
+        }
 
         inner.state = SandboxState::Running;
 

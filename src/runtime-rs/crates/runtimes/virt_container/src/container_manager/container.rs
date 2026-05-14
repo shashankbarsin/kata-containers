@@ -293,10 +293,22 @@ impl Container {
             ..Default::default()
         };
 
-        self.agent
-            .create_container(r)
-            .await
-            .context("agent create container")?;
+        // Sandbox snapshot/restore: in restore mode the guest kata-agent
+        // already has the original container running (its process tree was
+        // captured in the snapshot). Issuing CreateContainerRequest with
+        // the same id would race with the agent's existing state and hangs
+        // with DeadlineExceeded. Skip the agent grpc; the local Container
+        // bookkeeping above (devices, IO, hooks, resources) is still done
+        // so the shim can subsequently report container readiness.
+        if self.resource_manager.is_restore_from_snapshot() {
+            info!(sl!(), "create_container: short-circuited (restore mode)";
+                  "container" => &config.container_id);
+        } else {
+            self.agent
+                .create_container(r)
+                .await
+                .context("agent create container")?;
+        }
         self.resource_manager.dump().await;
         Ok(())
     }
@@ -309,7 +321,11 @@ impl Container {
         let mut inner = self.inner.write().await;
         match process.process_type {
             ProcessType::Container => {
-                if let Err(err) = inner.start_container(&process.container_id).await {
+                let restore_mode = self.resource_manager.is_restore_from_snapshot();
+                if let Err(err) = inner
+                    .start_container(&process.container_id, restore_mode)
+                    .await
+                {
                     let device_manager = self.resource_manager.get_device_manager().await;
                     let _ = inner.stop_process(process, true, &device_manager).await;
                     return Err(err);
