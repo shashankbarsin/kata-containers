@@ -78,6 +78,14 @@ pub struct CloudHypervisorInner {
     pub(crate) guest_memory_block_size_mb: u32,
 
     pub(crate) exit_notify: Option<mpsc::Sender<i32>>,
+
+    // AKS Pod Snapshot POC (Phase C4): when Some(dir) the next call to
+    // start_vm() will launch cloud-hypervisor with `--restore source_url=
+    // file://<dir>` instead of going through the create/boot HTTP dance.
+    // The field is intentionally not persisted in HypervisorState because
+    // the restore is a one-shot operation: once the VM is up the same
+    // sandbox runs identically to a freshly booted one.
+    pub(crate) restore_src: Option<String>,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
@@ -120,6 +128,8 @@ impl CloudHypervisorInner {
             guest_memory_block_size_mb: 0,
 
             exit_notify,
+
+            restore_src: None,
         }
     }
 

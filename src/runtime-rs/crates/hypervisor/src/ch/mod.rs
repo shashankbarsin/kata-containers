@@ -106,6 +106,11 @@ impl Hypervisor for CloudHypervisor {
         inner.save_vm(dest_dir).await
     }
 
+    async fn prepare_for_restore(&self, snapshot_src: &str) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.prepare_for_restore(snapshot_src).await
+    }
+
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
         let mut inner = self.inner.write().await;
         inner.add_device(device).await

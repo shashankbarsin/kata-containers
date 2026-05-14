@@ -140,6 +140,16 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     // build the `file://...` destination URL passed to /vm.snapshot.
     async fn save_vm(&self, dest_dir: &str) -> Result<()>;
     async fn resume_vm(&self) -> Result<()>;
+    // AKS Pod Snapshot POC (Phase C4): arm this hypervisor instance to launch
+    // the next start_vm() in restore mode, sourcing VM state from
+    // <snapshot_src>. Implementations that don't support restore (qemu,
+    // dragonball, firecracker, remote) return Err so callers see a clean
+    // "not supported" rather than silently doing a fresh boot.
+    async fn prepare_for_restore(&self, _snapshot_src: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "prepare_for_restore is not implemented for this hypervisor"
+        ))
+    }
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)>; // returns (old_vcpus, new_vcpus)
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)>;
 

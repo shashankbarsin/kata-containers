@@ -372,6 +372,24 @@ impl CloudHypervisorInner {
             cmd.args(["--seccomp", "false"]);
         }
 
+        // AKS Pod Snapshot POC (Phase C4): if prepare_for_restore() armed a
+        // snapshot source, append `--restore source_url=file://<dir>`. CLH
+        // does the CreateVM+BootVM dance internally as part of --restore so
+        // start_vm() also skips boot_vm() below.
+        //
+        // NOTE: this initial port emits the no-net-fd form of --restore; a
+        // follow-up will plumb the new sandbox's tap fds through Command's
+        // ExtraFiles / pre_exec dup2 and append `,net_fds=[id@fd,...]`. For
+        // snapshots with zero net devices the launch path is already
+        // exercisable end-to-end.
+        if let Some(src) = &self.restore_src {
+            let restore_val = format!("source_url=file://{src}");
+            info!(sl!(), "cloud_hypervisor_launch: restore mode";
+                  "sandbox" => &self.id,
+                  "restore_arg" => &restore_val);
+            cmd.args(["--restore", &restore_val]);
+        }
+
         let netns = self.netns.clone();
         if let Some(netns_ref) = &self.netns {
             info!(sl!(), "set netns for vmm : {:?}", netns_ref);
@@ -658,7 +676,15 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::VmmServerReady;
 
-        self.boot_vm().await?;
+        // AKS Pod Snapshot POC (Phase C4): in restore mode CLH does
+        // CreateVM+BootVM internally as part of --restore, so skip the
+        // explicit boot_vm() that issues HTTP vm.create + vm.boot.
+        if self.restore_src.is_some() {
+            info!(sl!(), "start_vm: skipping boot_vm (restore mode)";
+                  "sandbox" => &self.id);
+        } else {
+            self.boot_vm().await?;
+        }
 
         self.state = VmmState::VmRunning;
 
@@ -728,6 +754,38 @@ impl CloudHypervisorInner {
         cloud_hypervisor_vm_snapshot(&self.api_socket, &url)
             .await
             .with_context(|| format!("cloud_hypervisor_vm_snapshot to {url}"))?;
+        Ok(())
+    }
+
+    // AKS Pod Snapshot POC (Phase C4): arm the next start_vm() to launch
+    // cloud-hypervisor in restore mode, sourcing the VM state from
+    // <snapshot_src>. The actual --restore argv construction lives in
+    // cloud_hypervisor_launch(); start_vm() also short-circuits boot_vm()
+    // when this is set because CLH does CreateVM+BootVM internally as part
+    // of --restore (see clh.go::launchClh comment block).
+    pub(crate) async fn prepare_for_restore(&mut self, snapshot_src: &str) -> Result<()> {
+        if snapshot_src.is_empty() {
+            return Err(anyhow!("prepare_for_restore: snapshot_src is required"));
+        }
+        if !std::path::Path::new(snapshot_src).is_dir() {
+            return Err(anyhow!(
+                "prepare_for_restore: snapshot_src {} is not a directory",
+                snapshot_src
+            ));
+        }
+        for fname in ["state.json", "config.json"] {
+            let p = std::path::Path::new(snapshot_src).join(fname);
+            if !p.exists() {
+                return Err(anyhow!(
+                    "prepare_for_restore: snapshot missing required file {}",
+                    p.display()
+                ));
+            }
+        }
+        info!(sl!(), "prepare_for_restore: arming restore launch";
+              "sandbox" => &self.id,
+              "snapshot_src" => snapshot_src);
+        self.restore_src = Some(snapshot_src.to_string());
         Ok(())
     }
 
