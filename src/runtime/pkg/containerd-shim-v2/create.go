@@ -183,6 +183,21 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		// within it.
 		removeCDIAnnotations(ociSpec.Annotations)
 
+		// AKS Pod Snapshot — when the OCI spec carries the restore annotation
+		// (set by the AKS pod-snapshot controller via Pod annotation) or the
+		// containerd CreateTask request carries a Checkpoint path, route the
+		// sandbox-create through the hypervisor's restore path. The annotation
+		// takes precedence over the containerd Checkpoint field.
+		if snapPath, ok := ociSpec.Annotations[annotations.PodSnapshotRestoreFromPathKey]; ok && snapPath != "" {
+			shimLog.WithField("snapshot-path", snapPath).Info("AKS Pod Snapshot restore: using path from OCI annotation")
+			s.config.HypervisorConfig.RestoreFromSnapshot = true
+			s.config.HypervisorConfig.SnapshotPath = snapPath
+		} else if r.Checkpoint != "" {
+			shimLog.WithField("snapshot-path", r.Checkpoint).Info("AKS Pod Snapshot restore: using path from containerd Checkpoint field")
+			s.config.HypervisorConfig.RestoreFromSnapshot = true
+			s.config.HypervisorConfig.SnapshotPath = r.Checkpoint
+		}
+
 		// Pass service's context instead of local ctx to CreateSandbox(), since local
 		// ctx will be canceled after this rpc service call, but the sandbox will live
 		// across multiple rpc service calls.

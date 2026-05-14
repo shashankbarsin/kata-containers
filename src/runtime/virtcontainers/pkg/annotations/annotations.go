@@ -22,6 +22,16 @@ const (
 	ContainerTypeKey = kataAnnotationsPrefix + "pkg.oci.container_type"
 
 	SandboxConfigPathKey = kataAnnotationsPrefix + "config_path"
+
+	//
+	// AKS Pod Snapshot — when this annotation is present on the sandbox-create
+	// OCI spec, the kata containerd-shim will route the create through the
+	// hypervisor's restore-from-snapshot path instead of the normal boot path.
+	// Value is the absolute path to the snapshot directory previously written
+	// by Sandbox.Snapshot (containing kata-snapshot.json + the hypervisor's
+	// state files). Set by the AKS pod-snapshot node agent on the restore Pod.
+	//
+	PodSnapshotRestoreFromPathKey = "podsnapshot.aks.io/restore-from-path"
 )
 
 // Annotations related to Hypervisor configuration
