@@ -212,6 +212,13 @@ DEFVCPUS := 1
 DEFMAXVCPUS := 0
 # Default memory size in MiB
 DEFMEMSZ := 2048
+# Default memory size in MiB for the Cloud Hypervisor configuration.
+# CLH supports virtio-balloon free-page-reporting and (with our enable_mergeable
+# knob) KSM, so it can safely boot with a much smaller floor than QEMU and
+# hot-add memory on demand up to default_maxmemory (= host RAM when 0).
+# Lower floor → higher pod density on the same node. Override at build time
+# with `make DEFMEMSZ_CLH=<MiB>` if your workload needs a larger initial size.
+DEFMEMSZ_CLH := 256
 # Default memory slots
 # Cases to consider :
 # - nvdimm rootfs image
@@ -751,6 +758,7 @@ USER_VARS += SYSCONFDIR
 USER_VARS += DEFVCPUS
 USER_VARS += DEFMAXVCPUS
 USER_VARS += DEFMEMSZ
+USER_VARS += DEFMEMSZ_CLH
 USER_VARS += DEFMEMSLOTS
 USER_VARS += DEFMAXMEMSZ
 USER_VARS += DEFBRIDGES

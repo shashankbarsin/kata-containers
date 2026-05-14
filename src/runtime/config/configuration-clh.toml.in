@@ -95,8 +95,17 @@ default_vcpus = 1
 default_maxvcpus = @DEFMAXVCPUS@
 
 # Default memory size in MiB for SB/VM.
-# If unspecified then it will be set @DEFMEMSZ@ MiB.
-default_memory = @DEFMEMSZ@
+# If unspecified then it will be set @DEFMEMSZ_CLH@ MiB.
+#
+# Cloud Hypervisor density tuning:
+#   * free-page-reporting (BalloonConfig.free_page_reporting=true) reclaims
+#     guest-freed pages back to the host (see reclaim_guest_freed_memory).
+#   * MADV_MERGEABLE on guest RAM (see enable_mergeable) lets host KSM dedup
+#     identical pages across sibling VMs.
+#   * default_maxmemory below caps how much CLH can hot-add on demand.
+# Together these allow a small initial allocation per VM without starving
+# real workloads — the kernel will hot-add up to default_maxmemory if needed.
+default_memory = @DEFMEMSZ_CLH@
 
 # Default memory slots per SB/VM.
 # If unspecified then it will be set @DEFMEMSLOTS@.
