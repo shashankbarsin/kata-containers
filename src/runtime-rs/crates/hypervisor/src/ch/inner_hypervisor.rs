@@ -827,6 +827,10 @@ impl CloudHypervisorInner {
     // cloud_hypervisor_launch(); start_vm() also short-circuits boot_vm()
     // when this is set because CLH does CreateVM+BootVM internally as part
     // of --restore (see clh.go::launchClh comment block).
+    //
+    // Phase C4.2: before stashing the path we patch the snapshot in place
+    // for the new sandbox id (config.json) and apply the vhost-user-fs
+    // activate-on-restore workaround (state.json). Both are idempotent.
     pub(crate) async fn prepare_for_restore(&mut self, snapshot_src: &str) -> Result<()> {
         if snapshot_src.is_empty() {
             return Err(anyhow!("prepare_for_restore: snapshot_src is required"));
@@ -846,6 +850,17 @@ impl CloudHypervisorInner {
                 ));
             }
         }
+
+        let config_path = std::path::Path::new(snapshot_src).join("config.json");
+        let state_path = std::path::Path::new(snapshot_src).join("state.json");
+        crate::ch::snapshot_rewrite::rewrite_snapshot_config_for_new_sandbox(
+            &config_path,
+            &self.id,
+        )
+        .context("rewriting snapshot config for new sandbox")?;
+        crate::ch::snapshot_rewrite::rewrite_snapshot_state_for_new_sandbox(&state_path)
+            .context("rewriting snapshot state for new sandbox")?;
+
         info!(sl!(), "prepare_for_restore: arming restore launch";
               "sandbox" => &self.id,
               "snapshot_src" => snapshot_src);

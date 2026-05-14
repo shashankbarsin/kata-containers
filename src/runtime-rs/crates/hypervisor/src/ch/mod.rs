@@ -26,6 +26,7 @@ macro_rules! sl {
 mod inner;
 mod inner_device;
 mod inner_hypervisor;
+mod snapshot_rewrite;
 mod utils;
 
 use inner::CloudHypervisorInner;
