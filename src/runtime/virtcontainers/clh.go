@@ -1567,6 +1567,16 @@ func (clh *cloudHypervisor) buildRestoreArgs() ([]string, []*os.File, error) {
 		return nil, nil, fmt.Errorf("rewriting snapshot config: %w", err)
 	}
 
+	// POC workaround: patch state.json so CLH skips activate() on the
+	// vhost-user-fs PCI device. Without this CLH hangs forever waiting
+	// on a re-handshake with the freshly-spawned virtiofsd, which has
+	// no prior FUSE session state. See clh_snapshot_restore_workaround.go
+	// for the full diagnosis; this hook gets removed when Phase C6
+	// (virtiofsd migration in the Rust runtime) lands.
+	if err := rewriteSnapshotStateForNewSandbox(filepath.Join(src, "state.json")); err != nil {
+		return nil, nil, fmt.Errorf("rewriting snapshot state: %w", err)
+	}
+
 	snapNets, err := readSnapshotNetIDs(filepath.Join(src, "config.json"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading snapshot net ids: %w", err)
