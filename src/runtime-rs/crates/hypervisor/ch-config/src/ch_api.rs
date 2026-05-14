@@ -178,3 +178,26 @@ pub async fn cloud_hypervisor_vm_resize(
     let body = serde_json::to_string(&vmresize)?;
     api_command(api_socket, "PUT", "vm.resize", Some(body), None).await
 }
+
+/// Pause a previously booted VM. Mirrors PUT /vm.pause from the CLH HTTP API.
+pub async fn cloud_hypervisor_vm_pause(api_socket: &ApiSocket) -> Result<Option<String>> {
+    api_command(api_socket, "PUT", "vm.pause", None, None).await
+}
+
+/// Resume a previously paused VM. Mirrors PUT /vm.resume from the CLH HTTP API.
+pub async fn cloud_hypervisor_vm_resume(api_socket: &ApiSocket) -> Result<Option<String>> {
+    api_command(api_socket, "PUT", "vm.resume", None, None).await
+}
+
+/// Snapshot a VM, writing it to `destination_url` (e.g. `file:///tmp/snap`).
+///
+/// The caller is responsible for pausing the VM first (mirrors the contract
+/// of qemu's Save) and for ensuring the destination directory exists with
+/// permissions Cloud Hypervisor can write through.
+pub async fn cloud_hypervisor_vm_snapshot(
+    api_socket: &ApiSocket,
+    destination_url: &str,
+) -> Result<Option<String>> {
+    let body = serde_json::json!({ "destination_url": destination_url }).to_string();
+    api_command(api_socket, "PUT", "vm.snapshot", Some(body), None).await
+}

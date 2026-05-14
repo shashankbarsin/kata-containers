@@ -21,7 +21,8 @@ use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
 use ch_config::{
     ch_api::{
-        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
+        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
+        cloud_hypervisor_vm_resize, cloud_hypervisor_vm_resume, cloud_hypervisor_vm_snapshot,
         cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
     },
     VmResize,
@@ -686,15 +687,44 @@ impl CloudHypervisorInner {
         Ok(0)
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
+    pub(crate) async fn pause_vm(&self) -> Result<()> {
+        info!(sl!(), "pause_vm: PUT /vm.pause";
+              "sandbox" => &self.id);
+        cloud_hypervisor_vm_pause(&self.api_socket)
+            .await
+            .context("cloud_hypervisor_vm_pause")?;
         Ok(())
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&self) -> Result<()> {
+        info!(sl!(), "resume_vm: PUT /vm.resume";
+              "sandbox" => &self.id);
+        cloud_hypervisor_vm_resume(&self.api_socket)
+            .await
+            .context("cloud_hypervisor_vm_resume")?;
         Ok(())
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
+        // AKS Pod Snapshot POC (Phase C2): port of the Go runtime's SaveVM().
+        // The Go implementation mirrors the qemu Save contract: the caller has
+        // already paused the VM, and SaveVM is responsible only for invoking
+        // /vm.snapshot with a destination directory. The directory layout
+        // matches what `cloud-hypervisor --restore source_url=...` expects.
+        let dest_dir = std::path::Path::new(&self.run_dir).join("snapshot");
+        std::fs::create_dir_all(&dest_dir).with_context(|| {
+            format!(
+                "save_vm: create snapshot destination {}",
+                dest_dir.display()
+            )
+        })?;
+        let url = format!("file://{}", dest_dir.display());
+        info!(sl!(), "save_vm: PUT /vm.snapshot";
+              "sandbox" => &self.id,
+              "destination_url" => &url);
+        cloud_hypervisor_vm_snapshot(&self.api_socket, &url)
+            .await
+            .with_context(|| format!("cloud_hypervisor_vm_snapshot to {url}"))?;
         Ok(())
     }
 
