@@ -18,6 +18,22 @@ import (
 type RestoreConfig struct {
 	SourceUrl string `json:"source_url"`
 	Prefault  *bool  `json:"prefault,omitempty"`
+	// NetFds is required when restoring a snapshot whose VM had network
+	// devices: each entry maps an existing CLH net device ID (as written in
+	// the snapshot's config.json, e.g. "_net1") to the number of file
+	// descriptors the caller will pass via the Unix-socket OOB on the
+	// /vm.restore call. Added in CLH v33+; the kata-vendored OpenAPI client
+	// at v0.3.0 did not include this field — the AKS Pod Snapshot POC
+	// extends the model rather than regenerating the whole client. Without
+	// this CLH errors with "Net id _netN is associated with FDs and is required".
+	NetFds []RestoredNetConfig `json:"net_fds,omitempty"`
+}
+
+// RestoredNetConfig identifies one network device in a snapshot and the
+// number of host file descriptors the restore call will provide for it.
+type RestoredNetConfig struct {
+	Id     string `json:"id"`
+	NumFds int    `json:"num_fds"`
 }
 
 // NewRestoreConfig instantiates a new RestoreConfig object
@@ -101,6 +117,9 @@ func (o RestoreConfig) MarshalJSON() ([]byte, error) {
 	}
 	if o.Prefault != nil {
 		toSerialize["prefault"] = o.Prefault
+	}
+	if len(o.NetFds) > 0 {
+		toSerialize["net_fds"] = o.NetFds
 	}
 	return json.Marshal(toSerialize)
 }

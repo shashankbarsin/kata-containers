@@ -75,6 +75,13 @@ func newClhConfig() (HypervisorConfig, error) {
 
 type clhClientMock struct {
 	vmInfo chclient.VmInfo
+
+	// Recorded request bodies — tests assert against these to verify the
+	// production code wired URLs / paths through correctly.
+	pauseCalled     bool
+	resumeCalled    bool
+	snapshotRequest *chclient.VmSnapshotConfig
+	restoreRequest  *chclient.RestoreConfig
 }
 
 func (c *clhClientMock) VmmPingGet(ctx context.Context) (chclient.VmmPingResponse, *http.Response, error) {
@@ -117,6 +124,31 @@ func (c *clhClientMock) VmAddDiskPut(ctx context.Context, diskConfig chclient.Di
 
 //nolint:golint
 func (c *clhClientMock) VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error) {
+	return nil, nil
+}
+
+func (c *clhClientMock) PauseVM(ctx context.Context) (*http.Response, error) {
+	c.pauseCalled = true
+	c.vmInfo.State = "Paused"
+	return nil, nil
+}
+
+func (c *clhClientMock) ResumeVM(ctx context.Context) (*http.Response, error) {
+	c.resumeCalled = true
+	c.vmInfo.State = clhStateRunning
+	return nil, nil
+}
+
+func (c *clhClientMock) VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error) {
+	cfg := vmSnapshotConfig
+	c.snapshotRequest = &cfg
+	return nil, nil
+}
+
+func (c *clhClientMock) VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error) {
+	cfg := restoreConfig
+	c.restoreRequest = &cfg
+	c.vmInfo.State = clhStateRunning
 	return nil, nil
 }
 
@@ -846,3 +878,121 @@ func TestClhCapabilities(t *testing.T) {
 	assert.True(c.IsNetworkDeviceHotplugSupported())
 	assert.True(c.IsBlockDeviceHotplugSupported())
 }
+
+// --------------------------------------------------------------------------
+// Phase 0 — sandbox-level snapshot/restore primitives (AKS Pod Snapshot POC)
+// --------------------------------------------------------------------------
+
+func TestClhPauseAndResumeVM(t *testing.T) {
+	assert := assert.New(t)
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+
+	mock := &clhClientMock{}
+	clh := &cloudHypervisor{config: cfg, APIClient: mock}
+
+	assert.NoError(clh.PauseVM(context.Background()))
+	assert.True(mock.pauseCalled, "PauseVM should call CLH /vm.pause endpoint")
+
+	assert.NoError(clh.ResumeVM(context.Background()))
+	assert.True(mock.resumeCalled, "ResumeVM should call CLH /vm.resume endpoint")
+}
+
+func TestClhSaveVMUsesSnapshotPath(t *testing.T) {
+	assert := assert.New(t)
+
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "snap")
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+	cfg.SnapshotPath = dest
+
+	mock := &clhClientMock{}
+	clh := &cloudHypervisor{config: cfg, APIClient: mock}
+
+	assert.NoError(clh.SaveVM())
+
+	// Destination directory must have been auto-created.
+	st, err := os.Stat(dest)
+	assert.NoError(err)
+	assert.True(st.IsDir())
+
+	// VM snapshot config sent to CLH must point at the explicit SnapshotPath.
+	assert.NotNil(mock.snapshotRequest)
+	assert.Equal("file://"+dest, mock.snapshotRequest.GetDestinationUrl())
+}
+
+func TestClhSaveVMFallsBackToMemoryPath(t *testing.T) {
+	// Backwards-compat: when SnapshotPath is empty (legacy templating-factory
+	// path), the destination must be derived from MemoryPath's parent dir.
+	assert := assert.New(t)
+
+	tmp := t.TempDir()
+	memPath := filepath.Join(tmp, "memory")
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+	cfg.MemoryPath = memPath
+
+	mock := &clhClientMock{}
+	clh := &cloudHypervisor{config: cfg, APIClient: mock}
+
+	assert.NoError(clh.SaveVM())
+
+	assert.NotNil(mock.snapshotRequest)
+	assert.Equal("file://"+tmp, mock.snapshotRequest.GetDestinationUrl())
+}
+
+func TestClhSaveVMErrorsWithoutPath(t *testing.T) {
+	assert := assert.New(t)
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+
+	clh := &cloudHypervisor{config: cfg, APIClient: &clhClientMock{}}
+	err = clh.SaveVM()
+	assert.Error(err)
+	assert.Contains(err.Error(), "SnapshotPath")
+}
+
+func TestClhRestoreVMMissingArtifacts(t *testing.T) {
+	assert := assert.New(t)
+
+	tmp := t.TempDir()
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+	cfg.SnapshotPath = tmp
+	cfg.RestoreFromSnapshot = true
+
+	clh := &cloudHypervisor{config: cfg, APIClient: &clhClientMock{}}
+
+	err = clh.restoreVM(context.Background())
+	assert.Error(err)
+	// Error must name the missing artifact so operators can act on it.
+	assert.Contains(err.Error(), "state.json")
+}
+
+func TestClhRestoreVMHappyPath(t *testing.T) {
+	assert := assert.New(t)
+
+	tmp := t.TempDir()
+	assert.NoError(os.WriteFile(filepath.Join(tmp, "state.json"), []byte("{}"), 0o600))
+	assert.NoError(os.WriteFile(filepath.Join(tmp, "config.json"), []byte("{}"), 0o600))
+
+	cfg, err := newClhConfig()
+	assert.NoError(err)
+	cfg.SnapshotPath = tmp
+	cfg.RestoreFromSnapshot = true
+
+	mock := &clhClientMock{}
+	clh := &cloudHypervisor{config: cfg, APIClient: mock}
+
+	assert.NoError(clh.restoreVM(context.Background()))
+
+	assert.NotNil(mock.restoreRequest)
+	assert.Equal("file://"+tmp, mock.restoreRequest.GetSourceUrl())
+}
+

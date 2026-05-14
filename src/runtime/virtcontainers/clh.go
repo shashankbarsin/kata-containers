@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,6 +115,14 @@ type clhClient interface {
 	VmAddDiskPut(ctx context.Context, diskConfig chclient.DiskConfig) (chclient.PciDeviceInfo, *http.Response, error)
 	// Remove a device from the VM
 	VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error)
+	// Pause a previously booted VM (PUT /vm.pause)
+	PauseVM(ctx context.Context) (*http.Response, error)
+	// Resume a previously paused VM (PUT /vm.resume)
+	ResumeVM(ctx context.Context) (*http.Response, error)
+	// Take a snapshot of the VM and write it to the destination URL (PUT /vm.snapshot)
+	VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error)
+	// Restore the VM from a previously taken snapshot at the source URL (PUT /vm.restore)
+	VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error)
 }
 
 type clhClientApi struct {
@@ -155,6 +164,22 @@ func (c *clhClientApi) VmAddDiskPut(ctx context.Context, diskConfig chclient.Dis
 
 func (c *clhClientApi) VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error) {
 	return c.ApiInternal.VmRemoveDevicePut(ctx).VmRemoveDevice(vmRemoveDevice).Execute()
+}
+
+func (c *clhClientApi) PauseVM(ctx context.Context) (*http.Response, error) {
+	return c.ApiInternal.PauseVM(ctx).Execute()
+}
+
+func (c *clhClientApi) ResumeVM(ctx context.Context) (*http.Response, error) {
+	return c.ApiInternal.ResumeVM(ctx).Execute()
+}
+
+func (c *clhClientApi) VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error) {
+	return c.ApiInternal.VmSnapshotPut(ctx).VmSnapshotConfig(vmSnapshotConfig).Execute()
+}
+
+func (c *clhClientApi) VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error) {
+	return c.ApiInternal.VmRestorePut(ctx).RestoreConfig(restoreConfig).Execute()
 }
 
 // This is done in order to be able to override such a function as part of
@@ -390,6 +415,21 @@ func (clh *cloudHypervisor) setupVirtiofsDaemon(ctx context.Context) error {
 	}
 
 	pid, err := clh.virtiofsDaemon.Start(ctx, func() {
+		// AKS Pod Snapshot POC: in restore mode CLH spends ~30s paging in a
+		// multi-GB memory file before its API server starts answering. If
+		// virtiofsd disconnects during this window (which it does — its
+		// vhost-user handshake doesn't tolerate the stall), the original
+		// callback would call clh.StopVM, flip clh.stopped=1, and the very
+		// next isClhRunning iteration in waitVMM would return
+		// (false, nil) — surfacing as the misleading
+		// "CLH is not running" error while CLH is in fact mid-restore and
+		// healthy. Suppress the auto-stop in restore mode; if virtiofsd
+		// genuinely needs to be respawned post-restore that's a follow-up.
+		clh.Logger().Warn("AKS Pod Snapshot DEBUG: virtiofsd onQuit callback fired")
+		if clh.config.RestoreFromSnapshot {
+			clh.Logger().Warn("AKS Pod Snapshot: virtiofsd quit in restore mode — suppressing StopVM so CLH can finish memory page-in")
+			return
+		}
 		clh.StopVM(ctx, false)
 	})
 	if err != nil {
@@ -771,8 +811,18 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	ctx, cancel := context.WithTimeout(ctx, bootTimeout*time.Second)
 	defer cancel()
 
-	if err := clh.bootVM(ctx); err != nil {
-		return err
+	// When restoring a sandbox from a previously taken snapshot, skip the
+	// normal CreateVM+BootVM dance and ask Cloud Hypervisor to load state from
+	// the snapshot directory. The freshly launched VMM will resume execution
+	// from the captured point.
+	if clh.config.RestoreFromSnapshot {
+		if err := clh.restoreVM(ctx); err != nil {
+			return err
+		}
+	} else {
+		if err := clh.bootVM(ctx); err != nil {
+			return err
+		}
 	}
 
 	clh.state.state = clhReady
@@ -1287,17 +1337,321 @@ func (clh *cloudHypervisor) Cleanup(ctx context.Context) error {
 
 func (clh *cloudHypervisor) PauseVM(ctx context.Context) error {
 	clh.Logger().WithField("function", "PauseVM").Info("Pause Sandbox")
+
+	cl := clh.client()
+
+	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+
+	if _, err := cl.PauseVM(ctx); err != nil {
+		clh.Logger().WithError(err).Error("Failed to pause VM")
+		return openAPIClientError(err)
+	}
 	return nil
 }
 
+// SaveVM persists the running VM's memory + device state to clh.config.SnapshotPath.
+// The destination is communicated to Cloud Hypervisor via /vm.snapshot using the
+// `file://` URL scheme. SaveVM expects PauseVM to have been called by the caller
+// (mirrors qemu's SaveVM contract used by the templating factory).
+//
+// When SnapshotPath is empty (the templating-factory path that still relies on
+// MemoryPath/DevicesStatePath), we fall back to the directory derived from
+// MemoryPath so the existing factory flow keeps working untouched.
 func (clh *cloudHypervisor) SaveVM() error {
-	clh.Logger().WithField("function", "saveSandboxC").Info("Save Sandbox")
+	clh.Logger().WithField("function", "SaveVM").Info("Save Sandbox")
+
+	cl := clh.client()
+
+	dest, err := clh.snapshotDestinationDir()
+	if err != nil {
+		return err
+	}
+
+	// Cloud Hypervisor writes a directory of files (config.json, state.json,
+	// memory-ranges-*) to the destination. Make sure it exists with sensible
+	// perms — otherwise CLH errors out with a non-obvious filesystem error.
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		return fmt.Errorf("creating snapshot destination %q: %w", dest, err)
+	}
+
+	// Snapshotting may take many seconds for non-trivial VMs (CLH writes the
+	// guest's full RAM to disk synchronously). Use a generous timeout —
+	// getClhAPITimeout() returns 1s by default which is fine for most API
+	// calls but far too tight for /vm.snapshot.
+	const snapshotTimeoutSeconds = 120
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeoutSeconds*time.Second)
+	defer cancel()
+
+	cfg := *chclient.NewVmSnapshotConfig()
+	cfg.SetDestinationUrl("file://" + dest)
+
+	if _, err := cl.VmSnapshotPut(ctx, cfg); err != nil {
+		clh.Logger().WithError(err).Errorf("Failed to snapshot VM to %s", dest)
+		return openAPIClientError(err)
+	}
 	return nil
 }
 
 func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {
 	clh.Logger().WithField("function", "ResumeVM").Info("Resume Sandbox")
+
+	cl := clh.client()
+
+	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+
+	if _, err := cl.ResumeVM(ctx); err != nil {
+		clh.Logger().WithError(err).Error("Failed to resume VM")
+		return openAPIClientError(err)
+	}
 	return nil
+}
+
+// SnapshotVM is the sandbox-level snapshot primitive. It writes the full VM
+// state to destDir and is invoked by Sandbox.Snapshot (called in turn by the
+// containerd-shim Checkpoint RPC). The caller is responsible for pausing and
+// resuming the VM around this call.
+//
+// SnapshotVM mutates clh.config.SnapshotPath so that SaveVM (which the rest of
+// the runtime calls) writes to the per-pod destination, then restores it on
+// exit so subsequent templating-style flows are not affected.
+func (clh *cloudHypervisor) SnapshotVM(ctx context.Context, destDir string) error {
+	if destDir == "" {
+		return fmt.Errorf("SnapshotVM: destDir is required")
+	}
+
+	prev := clh.config.SnapshotPath
+	clh.config.SnapshotPath = destDir
+	defer func() { clh.config.SnapshotPath = prev }()
+
+	return clh.SaveVM()
+}
+
+// snapshotDestinationDir returns the on-disk directory used as both the
+// destination of /vm.snapshot and the source of /vm.restore. Precedence:
+//  1. clh.config.SnapshotPath if set (sandbox-level snapshot/restore flow)
+//  2. directory of clh.config.MemoryPath (legacy templating-factory flow)
+func (clh *cloudHypervisor) snapshotDestinationDir() (string, error) {
+	if clh.config.SnapshotPath != "" {
+		return clh.config.SnapshotPath, nil
+	}
+	if clh.config.MemoryPath != "" {
+		return filepath.Dir(clh.config.MemoryPath), nil
+	}
+	return "", fmt.Errorf("neither SnapshotPath nor MemoryPath is set; cannot derive snapshot destination")
+}
+
+// restoreVM is the post-launchClh phase of restore. With Path A
+// (launchClh handles `--restore` + `--net id=,fd=` directly), CLH performs
+// CreateVM+BootVM internally during its own startup using the snapshot at
+// clh.config.SnapshotPath, so this function only validates that the
+// resulting VM is responsive. The heavy lifting moved to launchClh /
+// buildRestoreArgs.
+//
+// Earlier POC iterations went via /vm.restore over OOB SCM_RIGHTS, but CLH
+// silently rejects the inbound fds with "Ignoring FDs sent via the HTTP
+// request body". The CLI-flag path is the only one that actually works
+// against CLH v48.
+func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
+	clh.Logger().WithField("function", "restoreVM").Info("Verifying VM is responsive after --restore")
+
+	cl := clh.client()
+	pingCtx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+	if _, _, err := cl.VmmPingGet(pingCtx); err != nil {
+		return fmt.Errorf("post-restore VmmPing: %w", err)
+	}
+	return nil
+}
+
+// buildRestoreArgs constructs the additional CLH command-line arguments and
+// the inheritable file descriptors needed for `--restore`. Returns the args
+// to append to launchClh's args slice, plus the *os.File handles to add to
+// cmd.ExtraFiles (in the order they should be inherited; the first file
+// becomes child fd 3, the next fd 4, etc).
+//
+// Steps:
+//  1. Validate the snapshot dir + state.json + config.json.
+//  2. Rewrite the snapshot config so absolute paths to per-sandbox sockets
+//     point at the new sandbox-id (CLH's restore code path opens these).
+//  3. Read the snapshot's net device IDs in declaration order.
+//  4. Match them up with this sandbox's already-prepared tap fds.
+//  5. Emit `--restore source_url=file://...` plus one `--net id=,fd=` per
+//     device, with fd numbers starting at 3.
+func (clh *cloudHypervisor) buildRestoreArgs() ([]string, []*os.File, error) {
+	src, err := clh.snapshotDestinationDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, fname := range []string{"state.json", "config.json"} {
+		fp := filepath.Join(src, fname)
+		if _, err := os.Stat(fp); err != nil {
+			return nil, nil, fmt.Errorf("snapshot file %s not accessible: %w", fp, err)
+		}
+	}
+
+	// Patch absolute /run/vc/vm/<old-id>/ paths inside the snapshot config
+	// to point at this new sandbox's runtime dir. CLH binds vsock + connects
+	// virtiofsd at these paths during /vm.restore.
+	if err := clh.rewriteSnapshotConfigForNewSandbox(filepath.Join(src, "config.json")); err != nil {
+		return nil, nil, fmt.Errorf("rewriting snapshot config: %w", err)
+	}
+
+	snapNets, err := readSnapshotNetIDs(filepath.Join(src, "config.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading snapshot net ids: %w", err)
+	}
+
+	// Build the single `--restore` arg. The fd-bearing net devices go
+	// inside it as `net_fds=[<id>@<fd>,...]`. Per CLH v48 `--help`:
+	//
+	//   --restore <restore>
+	//     "source_url=<source_url>,prefault=on|off,
+	//      net_fds=<list_of_net_ids_with_their_associated_fds>"
+	//
+	// IMPORTANT: do NOT also pass `--kernel` or `--net` separately on
+	// restore. We tried that earlier and CLH silently took the
+	// fresh-boot path (VmCreate + VmBoot in the log) instead of
+	// restoring — net_fds inside `--restore` is the only path CLH's
+	// restore code understands.
+	restoreVal := "source_url=file://" + src
+	if len(snapNets) == 0 {
+		// Snapshot has no net devices — nothing else to plumb.
+		return []string{"--restore", restoreVal}, nil, nil
+	}
+
+	hostFiles := flattenNetDeviceFiles(clh.netDevicesFiles)
+	if len(hostFiles) == 0 {
+		return nil, nil, fmt.Errorf("snapshot has %d net device(s) but the new sandbox provided no tap fds; "+
+			"network namespace must be set up before launchClh in restore mode", len(snapNets))
+	}
+
+	var extraFiles []*os.File
+	// CLH inherits ExtraFiles[0] as child fd 3, ExtraFiles[1] as fd 4, ...
+	const firstChildFd = 3
+	fileIdx := 0
+	netFdEntries := make([]string, 0, len(snapNets))
+	for _, n := range snapNets {
+		if fileIdx+n.NumFds > len(hostFiles) {
+			return nil, nil, fmt.Errorf("snapshot expects %d fd(s) for net device %q but only %d remain in host pool",
+				n.NumFds, n.Id, len(hostFiles)-fileIdx)
+		}
+		// For each net device, emit one `<id>@<fd>` entry. For multi-fd
+		// (multi-queue) net devices, kata-clh's default is 1 fd per
+		// device; if a snapshot was taken with num_queues>1 a future
+		// extension will need `<id>@<fd1>:<fd2>` syntax (CLH supports
+		// it). For the POC we only emit one fd per device.
+		for i := 0; i < n.NumFds; i++ {
+			extraFiles = append(extraFiles, hostFiles[fileIdx+i])
+			netFdEntries = append(netFdEntries,
+				fmt.Sprintf("%s@%d", n.Id, firstChildFd+len(extraFiles)-1))
+		}
+		fileIdx += n.NumFds
+	}
+	restoreVal += ",net_fds=[" + strings.Join(netFdEntries, ",") + "]"
+
+	return []string{"--restore", restoreVal}, extraFiles, nil
+}
+
+// snapshotNetID is the (id, num_fds) tuple extracted from a CLH snapshot's
+// config.json `net` array, in declaration order.
+type snapshotNetID struct {
+	Id     string
+	NumFds int
+}
+
+// readSnapshotNetIDs parses the `net` section of a CLH snapshot config.json
+// and returns the device ID + fd-count for each, in declaration order. CLH's
+// /vm.restore needs these so it can re-attach the new sandbox's tap fds.
+func readSnapshotNetIDs(configPath string) ([]snapshotNetID, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Net []struct {
+			Id  string `json:"id"`
+			Fds []int  `json:"fds"`
+		} `json:"net"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", configPath, err)
+	}
+	out := make([]snapshotNetID, 0, len(doc.Net))
+	for _, n := range doc.Net {
+		// `fds: [-1]` in the snapshot means 1 expected fd; CLH writes the
+		// length of the original fds slice but blanks the values.
+		out = append(out, snapshotNetID{Id: n.Id, NumFds: len(n.Fds)})
+	}
+	return out, nil
+}
+
+// flattenNetDeviceFiles walks the net-device file map in deterministic MAC
+// order so two restores against the same sandbox produce the same fd ordering.
+func flattenNetDeviceFiles(m map[string][]*os.File) []*os.File {
+	macs := make([]string, 0, len(m))
+	for mac := range m {
+		macs = append(macs, mac)
+	}
+	sort.Strings(macs)
+	var out []*os.File
+	for _, mac := range macs {
+		out = append(out, m[mac]...)
+	}
+	return out
+}
+
+// rewriteSnapshotConfigForNewSandbox patches the snapshot's config.json in
+// place, swapping the original sandbox's runtime directory for the new
+// sandbox's. CLH bakes absolute paths for sockets it needs to bind (vsock /
+// clh.sock) and connect (virtiofsd.sock) into the snapshot config. Without
+// this rewrite CLH on /vm.restore tries to bind/connect at the old path
+// (which doesn't exist for the new sandbox) and either crashes or hangs.
+//
+// The substitution is purely textual on a "/run/vc/vm/<old-id>/" prefix; this
+// covers every per-sandbox-dir socket CLH writes. The state.json holds opaque
+// CRIU memory data and does not need rewriting.
+func (clh *cloudHypervisor) rewriteSnapshotConfigForNewSandbox(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Find the original sandbox's runtime dir from the FIRST per-sandbox path
+	// we recognise. Both the vsock and virtiofs sockets sit directly under
+	// /run/vc/vm/<sandbox-id>/.
+	const vmDirPrefix = "/run/vc/vm/"
+	idx := bytes.Index(data, []byte(vmDirPrefix))
+	if idx < 0 {
+		// Snapshot has no per-sandbox sockets — nothing to do.
+		return nil
+	}
+	rest := data[idx+len(vmDirPrefix):]
+	end := bytes.IndexAny(rest, "/\"")
+	if end <= 0 {
+		return fmt.Errorf("malformed sandbox-id in snapshot config at %s", configPath)
+	}
+	oldID := string(rest[:end])
+	if oldID == clh.id {
+		// Snapshot was already taken on this sandbox — nothing to do.
+		return nil
+	}
+
+	clh.Logger().WithField("old_sandbox_id", oldID).WithField("new_sandbox_id", clh.id).
+		Info("Rewriting snapshot config to replace old sandbox-id with new")
+
+	patched := bytes.ReplaceAll(data,
+		[]byte(vmDirPrefix+oldID+"/"),
+		[]byte(vmDirPrefix+clh.id+"/"))
+
+	// Write back atomically (write to temp + rename) so a partial write can't
+	// corrupt the snapshot.
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, patched, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, configPath)
 }
 
 // StopVM will stop the Sandbox's VM.
@@ -1556,10 +1910,40 @@ func (clh *cloudHypervisor) launchClh() error {
 		args = append(args, "--seccomp", "false")
 	}
 
+	// AKS Pod Snapshot POC — Path A: when restoring a sandbox-level snapshot,
+	// extend the CLH CLI with `--restore source_url=...` and one
+	// `--net id=<id>,fd=<n>` per net device the snapshot expects. CLH does
+	// CreateVM+BootVM internally as part of `--restore` (no follow-up HTTP
+	// call needed), but it requires net device fds to be inherited at
+	// process start time — POSTing them via OOB on /vm.restore is silently
+	// rejected (CLH logs "Ignoring FDs sent via the HTTP request body").
+	//
+	// extraFiles holds the *os.File handles for the new sandbox's tap fds
+	// in the order CLH should inherit them; ExtraFiles[0] -> child fd 3,
+	// ExtraFiles[1] -> child fd 4, etc.
+	var extraFiles []*os.File
+	if clh.config.RestoreFromSnapshot {
+		clh.Logger().Warn("AKS Pod Snapshot: launchClh is in restore mode")
+		restoreArgs, restoreFiles, err := clh.buildRestoreArgs()
+		if err != nil {
+			clh.Logger().WithError(err).Warn("AKS Pod Snapshot: buildRestoreArgs failed")
+			return fmt.Errorf("building restore args: %w", err)
+		}
+		args = append(args, restoreArgs...)
+		extraFiles = restoreFiles
+		clh.Logger().Warnf("AKS Pod Snapshot: restore args=%q extra_fds=%d", strings.Join(restoreArgs, " "), len(extraFiles))
+	} else {
+		clh.Logger().Warn("AKS Pod Snapshot: launchClh in NORMAL (non-restore) mode")
+	}
+
 	clh.Logger().WithField("path", clhPath).Info()
 	clh.Logger().WithField("args", strings.Join(args, " ")).Info()
+	clh.Logger().Warnf("AKS Pod Snapshot DEBUG: full args = [%s] %s", clhPath, strings.Join(args, " "))
 
 	cmdHypervisor := exec.Command(clhPath, args...)
+	if len(extraFiles) > 0 {
+		cmdHypervisor.ExtraFiles = extraFiles
+	}
 	if clh.config.Debug {
 		cmdHypervisor.Env = os.Environ()
 		cmdHypervisor.Env = append(cmdHypervisor.Env, "RUST_BACKTRACE=full")
@@ -1569,6 +1953,17 @@ func (clh *cloudHypervisor) launchClh() error {
 		}
 	}
 	cmdHypervisor.Stderr = cmdHypervisor.Stdout
+
+	// AKS Pod Snapshot POC: always capture CLH stdout+stderr to a per-VM log
+	// file so restore failures (which historically only surface as
+	// "unexpected EOF" on the API socket) leave a forensic trail. The log
+	// file lives in the same dir as the API socket.
+	if clh.state.apiSocket != "" {
+		if logFile, ferr := os.Create(filepath.Join(filepath.Dir(clh.state.apiSocket), "clh.log")); ferr == nil {
+			cmdHypervisor.Stdout = logFile
+			cmdHypervisor.Stderr = logFile
+		}
+	}
 
 	attr := syscall.SysProcAttr{}
 	attr.Credential = &syscall.Credential{
@@ -1585,7 +1980,14 @@ func (clh *cloudHypervisor) launchClh() error {
 
 	clh.state.PID = cmdHypervisor.Process.Pid
 
-	if err := clh.waitVMM(clhTimeout); err != nil {
+	// AKS Pod Snapshot POC: in restore mode CLH is busy slurping the
+	// snapshot's memory-ranges file from disk before its API server starts
+	// answering vmm.ping. Use a much longer wait than clhTimeout (10s).
+	waitTimeout := uint(clhTimeout)
+	if clh.config.RestoreFromSnapshot {
+		waitTimeout = 600
+	}
+	if err := clh.waitVMM(waitTimeout); err != nil {
 		clh.Logger().WithError(err).Warn("cloud-hypervisor init failed")
 		return err
 	}
@@ -1634,31 +2036,49 @@ func (clh *cloudHypervisor) isClhRunning(timeout uint) (bool, error) {
 	pid := clh.state.PID
 
 	if atomic.LoadInt32(&clh.stopped) != 0 {
+		clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: clh.stopped flag set on entry, returning (false, nil) (pid=%d)", pid)
 		return false, nil
 	}
 
 	timeStart := time.Now()
 	cl := clh.client()
+	iter := 0
+	lastLog := timeStart
 	for {
+		iter++
 		waitedPid, err := syscall.Wait4(pid, nil, syscall.WNOHANG, nil)
 		if waitedPid == pid && err == nil {
+			clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: Wait4 reaped pid=%d after %.2fs (iter=%d) — CLH process exited", pid, time.Since(timeStart).Seconds(), iter)
+			return false, nil
+		}
+
+		if atomic.LoadInt32(&clh.stopped) != 0 {
+			clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: clh.stopped flag flipped mid-loop after %.2fs (iter=%d) — likely virtiofsd onQuit fired", time.Since(timeStart).Seconds(), iter)
 			return false, nil
 		}
 
 		err = syscall.Kill(pid, syscall.Signal(0))
 		if err != nil {
+			clh.Logger().WithError(err).Warnf("AKS Pod Snapshot DEBUG: isClhRunning: kill(0) on pid=%d failed after %.2fs (iter=%d) — process gone", pid, time.Since(timeStart).Seconds(), iter)
 			return false, nil
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), clh.getClhAPITimeout()*time.Second)
 		_, _, err = cl.VmmPingGet(ctx)
 		cancel()
 		if err == nil {
+			clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: VmmPingGet succeeded after %.2fs (iter=%d)", time.Since(timeStart).Seconds(), iter)
 			return true, nil
-		} else {
-			clh.Logger().WithError(err).Warning("clh.VmmPingGet API call failed")
+		}
+
+		// Heartbeat log every 5s to confirm the loop is still polling and
+		// not silently exiting via some unexpected path.
+		if time.Since(lastLog).Seconds() >= 5 {
+			clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: still polling pid=%d at %.2fs (iter=%d) timeout=%ds last_err=%v", pid, time.Since(timeStart).Seconds(), iter, timeout, err)
+			lastLog = time.Now()
 		}
 
 		if time.Since(timeStart).Seconds() > float64(timeout) {
+			clh.Logger().Warnf("AKS Pod Snapshot DEBUG: isClhRunning: hit outer timeout=%ds after %d iterations", timeout, iter)
 			return false, fmt.Errorf("Failed to connect to API (timeout %ds): %s", timeout, openAPIClientError(err))
 		}
 
