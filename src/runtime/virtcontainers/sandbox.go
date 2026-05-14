@@ -2460,6 +2460,16 @@ func (s *Sandbox) updateResources(ctx context.Context) error {
 		return fmt.Errorf("sandbox config is nil")
 	}
 
+	// AKS Pod Snapshot POC: in restore mode the VM was checkpointed with
+	// its CPUs and memory already provisioned and online inside the guest.
+	// Issuing resize/online requests against the new VM (or its agent)
+	// races with that pre-existing state and hangs the agent (e.g.
+	// OnlineCPUMemRequest timed out). Skip resource updates entirely.
+	if s.config.HypervisorConfig.RestoreFromSnapshot {
+		s.Logger().Warn("AKS Pod Snapshot: updateResources skipped in restore mode (CPUs/memory already online from snapshot)")
+		return nil
+	}
+
 	if s.config.StaticResourceMgmt {
 		s.Logger().Debug("no resources updated: static resource management is set")
 		return nil
