@@ -1491,15 +1491,20 @@ func (clh *cloudHypervisor) snapshotDestinationDir() (string, error) {
 // (launchClh handles `--restore` + `--net id=,fd=` directly), CLH performs
 // CreateVM+BootVM internally during its own startup using the snapshot at
 // clh.config.SnapshotPath, so this function only validates that the
-// resulting VM is responsive. The heavy lifting moved to launchClh /
-// buildRestoreArgs.
+// resulting VM is responsive and then resumes it.
+//
+// CLH's /vm.restore code path leaves the VM in the Paused state — see
+// vmm/src/cpu.rs:start_restored_vcpus which calls activate_vcpus with
+// paused=Some(true). Without an explicit /vm.resume the guest never runs,
+// the kata-agent vsock listener never resumes, and the shim's first grpc
+// Check times out. We therefore issue /vm.resume after a successful ping.
 //
 // Earlier POC iterations went via /vm.restore over OOB SCM_RIGHTS, but CLH
 // silently rejects the inbound fds with "Ignoring FDs sent via the HTTP
 // request body". The CLI-flag path is the only one that actually works
 // against CLH v48.
 func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
-	clh.Logger().WithField("function", "restoreVM").Info("Verifying VM is responsive after --restore")
+	clh.Logger().WithField("function", "restoreVM").Warn("AKS Pod Snapshot: restoreVM entered; verifying VM is responsive after --restore")
 
 	cl := clh.client()
 	pingCtx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
@@ -1507,7 +1512,87 @@ func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
 	if _, _, err := cl.VmmPingGet(pingCtx); err != nil {
 		return fmt.Errorf("post-restore VmmPing: %w", err)
 	}
+
+	clh.Logger().WithField("function", "restoreVM").Warn("AKS Pod Snapshot: resuming restored VM (CLH leaves vCPUs paused after /vm.restore)")
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer resumeCancel()
+	if _, err := cl.ResumeVM(resumeCtx); err != nil {
+		return fmt.Errorf("post-restore ResumeVM: %w", openAPIClientError(err))
+	}
+
+	clh.Logger().WithField("function", "restoreVM").Warn("AKS Pod Snapshot: VM resumed; waiting for kata-agent vsock listener")
+	if err := clh.waitAgentVsockReady(ctx); err != nil {
+		return fmt.Errorf("post-restore agent vsock readiness: %w", err)
+	}
 	return nil
+}
+
+// waitAgentVsockReady polls the CLH hybrid-vsock UDS for kata-agent
+// readiness after restore. The agent's vsock listener (port vSockPort) is
+// the first thing the shim's startSandbox exercises via grpc Check.
+// A restored guest takes appreciably longer than a fresh boot to begin
+// servicing vsock connections (tens of seconds for memory page-in and
+// kernel timer catch-up), so we eagerly poll here instead of relying
+// solely on the agent client's default dial timeout.
+func (clh *cloudHypervisor) waitAgentVsockReady(ctx context.Context) error {
+	udsPath, err := clh.vsockSocketPath(clh.id)
+	if err != nil {
+		return fmt.Errorf("vsock UDS path: %w", err)
+	}
+
+	const (
+		probeTimeout         = 180 * time.Second
+		handshakeReadTimeout = 5 * time.Second
+		retryBackoff         = 250 * time.Millisecond
+	)
+
+	logger := clh.Logger().WithField("function", "waitAgentVsockReady")
+	start := time.Now()
+	deadline := start.Add(probeTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		conn, err := net.DialTimeout("unix", udsPath, 2*time.Second)
+		if err != nil {
+			lastErr = err
+			time.Sleep(retryBackoff)
+			continue
+		}
+
+		if _, err := fmt.Fprintf(conn, "CONNECT %d\n", vSockPort); err != nil {
+			conn.Close()
+			lastErr = err
+			time.Sleep(retryBackoff)
+			continue
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
+		reader := bufio.NewReader(conn)
+		response, err := reader.ReadString('\n')
+		conn.Close()
+		if err != nil {
+			lastErr = err
+			time.Sleep(retryBackoff)
+			continue
+		}
+		if strings.Contains(response, "OK") {
+			logger.WithField("elapsed", time.Since(start).String()).
+				Warn("AKS Pod Snapshot: kata-agent vsock listener ready")
+			return nil
+		}
+		lastErr = fmt.Errorf("unexpected handshake response: %q", response)
+		time.Sleep(retryBackoff)
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timed out after %s", probeTimeout)
+	}
+	return fmt.Errorf("vsock probe failed (elapsed=%s): %w", time.Since(start), lastErr)
 }
 
 // buildRestoreArgs constructs the additional CLH command-line arguments and
