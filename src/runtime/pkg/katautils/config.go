@@ -153,6 +153,7 @@ type hypervisor struct {
 	DisableBlockDeviceUse          bool                      `toml:"disable_block_device_use"`
 	MemPrealloc                    bool                      `toml:"enable_mem_prealloc"`
 	ReclaimGuestFreedMemory        bool                      `toml:"reclaim_guest_freed_memory"`
+	EnableMergeable                bool                      `toml:"enable_mergeable"`
 	HugePages                      bool                      `toml:"enable_hugepages"`
 	VirtioMem                      bool                      `toml:"enable_virtio_mem"`
 	IOMMU                          bool                      `toml:"enable_iommu"`
@@ -1208,6 +1209,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSCache:                  h.VirtioFSCache,
 		MemPrealloc:                    h.MemPrealloc,
 		ReclaimGuestFreedMemory:        h.ReclaimGuestFreedMemory,
+		EnableMergeable:                h.EnableMergeable,
 		HugePages:                      h.HugePages,
 		FileBackedMemRootDir:           h.FileBackedMemRootDir,
 		FileBackedMemRootList:          h.FileBackedMemRootList,
@@ -1597,6 +1599,7 @@ func GetDefaultHypervisorConfig() vc.HypervisorConfig {
 		DefaultBridges:           defaultBridgesCount,
 		MemPrealloc:              defaultEnableMemPrealloc,
 		ReclaimGuestFreedMemory:  defaultEnableReclaimGuestFreedMemory,
+		EnableMergeable:          defaultEnableMergeable,
 		HugePages:                defaultEnableHugePages,
 		IOMMU:                    defaultEnableIOMMU,
 		IOMMUPlatform:            defaultEnableIOMMUPlatform,

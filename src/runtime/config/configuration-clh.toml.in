@@ -194,6 +194,24 @@ block_device_cache_direct = false
 # Default false
 reclaim_guest_freed_memory = false
 
+# Enable Kernel Samepage Merging (KSM) for the VM's guest RAM region.
+# When true and the host kernel has KSM enabled
+# (/sys/kernel/mm/ksm/run = 1, configured via the host's ksm/ksmtuned
+# services), Cloud Hypervisor will issue madvise(MADV_MERGEABLE) on the
+# guest memory mapping so identical pages across this and other
+# KSM-enabled VMs collapse to a single physical page. The biggest
+# density win is for fan-out scenarios where many sandboxes boot from
+# the same image (kernel/agent/runtime pages dominate); single-VM
+# benefit is modest.
+#
+# Cost: KSM scans guest memory in the background (host CPU); tune
+# /sys/kernel/mm/ksm/{pages_to_scan,sleep_millisecs} on the host. Pages
+# under MADV_MERGEABLE that get written break sharing (CoW), which is
+# usually fine for sandbox workloads.
+#
+# Default false
+enable_mergeable = false
+
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory
 # being allocated using huge pages.

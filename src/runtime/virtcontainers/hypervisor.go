@@ -788,6 +788,17 @@ type HypervisorConfig struct {
 	// ReclaimGuestFreedMemory is a sandbox annotation that specifies whether the memory freed by the guest will be reclaimed by the hypervisor or not.
 	ReclaimGuestFreedMemory bool
 
+	// EnableMergeable enables Kernel Samepage Merging (KSM) for the VM's
+	// guest RAM region. When true and the host kernel has KSM enabled
+	// (/sys/kernel/mm/ksm/run = 1), Cloud Hypervisor will issue
+	// madvise(MADV_MERGEABLE) on the guest memory mapping so identical
+	// pages across this and other KSM-enabled VMs collapse to a single
+	// physical page. The biggest density win is for fan-out scenarios
+	// where many sandboxes boot from the same image (kernel/agent/runtime
+	// pages dominate). Backends other than Cloud Hypervisor ignore this
+	// field today.
+	EnableMergeable bool
+
 	// HugePages specifies if the memory should be pre-allocated from huge pages
 	HugePages bool
 

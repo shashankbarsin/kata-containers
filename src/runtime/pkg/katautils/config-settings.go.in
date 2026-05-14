@@ -77,6 +77,7 @@ const defaultEnableIOThreads bool = false
 const defaultIndepIOThreads uint32 = 0
 const defaultEnableMemPrealloc bool = false
 const defaultEnableReclaimGuestFreedMemory bool = false
+const defaultEnableMergeable bool = false
 const defaultEnableHugePages bool = false
 const defaultEnableIOMMU bool = false
 const defaultEnableIOMMUPlatform bool = false

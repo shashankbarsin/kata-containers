@@ -611,6 +611,12 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	}
 	// Enable hugepages if needed
 	clh.vmconfig.Memory.Hugepages = func(b bool) *bool { return &b }(clh.config.HugePages)
+	// Opt the guest RAM mapping into KSM (madvise(MADV_MERGEABLE)) when the
+	// kata config asks for it. The host kernel must have KSM enabled
+	// independently for actual page sharing to happen.
+	if clh.config.EnableMergeable {
+		clh.vmconfig.Memory.SetMergeable(true)
+	}
 	if !clh.config.ConfidentialGuest {
 		hotplugSize := clh.config.DefaultMaxMemorySize
 		// OpenAPI only supports int64 values
