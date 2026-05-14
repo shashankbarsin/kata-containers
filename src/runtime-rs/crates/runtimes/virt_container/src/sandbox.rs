@@ -60,6 +60,7 @@ use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 ))]
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use kata_types::config::{hypervisor::Factory, TomlConfig};
+use kata_types::annotations::thirdparty::SANDBOX_SNAPSHOT_RESTORE_FROM_PATH;
 use kata_types::initdata::{calculate_initdata_digest, ProtectedPlatform};
 use oci_spec::runtime as oci;
 use persist::{self, sandbox_persist::Persist};
@@ -737,6 +738,38 @@ impl Sandbox for VirtSandbox {
             )
             .await
             .context("prepare vm")?;
+
+        // Sandbox snapshot/restore: if the create OCI spec carries the
+        // restore-from-path annotation, arm the hypervisor to launch in
+        // restore mode. The hypervisor's prepare_for_restore validates the
+        // snapshot directory and patches its config.json + state.json for
+        // the new sandbox id; start_vm() short-circuits the explicit
+        // boot_vm() in that case because the hypervisor does CreateVM and
+        // BootVM internally as part of --restore.
+        //
+        // KNOWN LIMITATION: this wires only the snapshot-source path. CLH
+        // /vm.restore additionally requires the sandbox's tap fds to be
+        // handed in via `net_fds=[<id>@<fd>,...]`. Those fds are owned by
+        // resource_manager (not the hypervisor) in the Rust runtime; the
+        // pairing call -- CloudHypervisor::set_restore_net_fds -- is
+        // intentionally not yet wired here. A snapshot of a sandbox with
+        // any net devices will currently fail at /vm.restore time with a
+        // missing-fd error from CLH; only no-network sandboxes restore
+        // successfully via this path today. See the Phase C5b.2 follow-on
+        // for the resource_manager / hypervisor trait extension that
+        // closes the gap.
+        if let Some(snapshot_src) = sandbox_config
+            .annotations
+            .get(SANDBOX_SNAPSHOT_RESTORE_FROM_PATH)
+        {
+            info!(sl!(), "sandbox start: restore mode";
+                  "sandbox" => id,
+                  "snapshot_src" => snapshot_src);
+            self.hypervisor
+                .prepare_for_restore(snapshot_src)
+                .await
+                .context("prepare hypervisor for restore")?;
+        }
 
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
