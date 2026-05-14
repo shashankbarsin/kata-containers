@@ -975,6 +975,71 @@ impl Sandbox for VirtSandbox {
         Ok(())
     }
 
+    // AKS Pod Snapshot POC (Phase C3): port of Sandbox.Snapshot from the Go
+    // runtime (src/runtime/virtcontainers/sandbox.go). The flow mirrors GKE
+    // Pod Snapshots with postCheckpoint=resume semantics:
+    //   1. Pause the VM (freezes every container as a side effect).
+    //   2. Ask the hypervisor to write its full state into <dest_dir>.
+    //   3. Resume the VM on the way out — best-effort even on snapshot
+    //      failure so a failed checkpoint doesn't leave the sandbox stuck.
+    //   4. Write a kata-snapshot.json sidecar last so its presence implies
+    //      the snapshot directory is complete and consumable by restore.
+    //
+    // dest_dir is the directory the hypervisor writes its artifacts into;
+    // because the Hypervisor::save_vm contract in runtime-rs encodes its own
+    // destination (run_dir/snapshot) we ignore dest_dir for the hypervisor
+    // step itself and only use it as the location for the sidecar manifest.
+    // This keeps wire-compat with the Go shim while letting the hypervisor
+    // backend choose where on disk it stores binary state.
+    async fn snapshot(&self, dest_dir: &str) -> Result<()> {
+        if dest_dir.is_empty() {
+            return Err(anyhow!("Sandbox.snapshot: dest_dir is required"));
+        }
+
+        info!(sl!(), "snapshot sandbox"; "dest_dir" => dest_dir);
+
+        std::fs::create_dir_all(dest_dir).with_context(|| {
+            format!("creating snapshot destination {dest_dir}")
+        })?;
+
+        self.hypervisor
+            .pause_vm()
+            .await
+            .context("pausing VM for snapshot")?;
+
+        let snap_result = self.hypervisor.save_vm().await.context("snapshotting VM");
+
+        // Best-effort resume on every exit path. We log resume failures but
+        // do not let them shadow a more interesting snapshot error.
+        if let Err(rerr) = self.hypervisor.resume_vm().await {
+            warn!(sl!(), "failed to resume VM after snapshot"; "error" => format!("{rerr:#}"));
+        }
+
+        snap_result?;
+
+        // Write the kata-snapshot.json sidecar last (matches the Go runtime's
+        // schema exactly so a Go-side restore can consume what we wrote).
+        let manifest = serde_json::json!({
+            "version": 1,
+            "sandboxID": self.sid,
+            "hypervisorType": "clh",
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(
+                chrono::SecondsFormat::Nanos,
+                true,
+            ),
+            "containerIDs": serde_json::Value::Array(Vec::new()),
+        });
+        let manifest_path = Path::new(dest_dir).join("kata-snapshot.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).context("marshalling snapshot manifest")?,
+        )
+        .with_context(|| format!("writing snapshot manifest {}", manifest_path.display()))?;
+
+        info!(sl!(), "sandbox snapshot complete"; "dest_dir" => dest_dir);
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<()> {
         info!(sl!(), "shutdown");
 

@@ -38,6 +38,17 @@ pub trait Sandbox: Send + Sync {
     async fn status(&self) -> Result<SandboxStatus>;
     async fn wait(&self) -> Result<SandboxExitInfo>;
 
+    // AKS Pod Snapshot POC (Phase C3): capture the running sandbox's full VM
+    // state into `dest_dir`. The default implementation is a stub so that
+    // hypervisor backends without a snapshot path (e.g. firecracker, the
+    // remote-hypervisor wrapper) keep compiling unchanged; the virt_container
+    // implementation overrides this and drives pause -> save_vm -> resume.
+    async fn snapshot(&self, _dest_dir: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "snapshot is not implemented for this sandbox backend"
+        ))
+    }
+
     // utils
     async fn set_iptables(&self, is_ipv6: bool, data: Vec<u8>) -> Result<Vec<u8>>;
     async fn get_iptables(&self, is_ipv6: bool) -> Result<Vec<u8>>;

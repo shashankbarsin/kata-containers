@@ -9,6 +9,7 @@ license = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 awaitgroup = "0.6.0"
+chrono = "0.4"
 containerd-shim-protos = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
