@@ -54,6 +54,17 @@ pub(crate) struct ResourceManagerInner {
     network: Option<Arc<dyn Network>>,
     share_fs: Option<Arc<dyn ShareFs>>,
 
+    /// Sandbox snapshot/restore: pre-snapshot guest interface identity
+    /// captured from the kata-snapshot.json sidecar at restore time,
+    /// as a list of `(interface_name, original_hw_addr)` tuples.
+    /// Populated by `set_restore_guest_interfaces` before
+    /// `setup_after_start_vm`. Used in restore mode by
+    /// `apply_network_to_agent_for_restore` to look up the in-guest
+    /// link by its pre-snapshot MAC (the guest's eth0 still carries
+    /// the snapshot's MAC after restore) while installing the new
+    /// pod's CNI IP. Empty for non-restore sandboxes.
+    pub(crate) restore_guest_interfaces: Vec<(String, String)>,
+
     pub rootfs_resource: RootFsResource,
     pub volume_resource: VolumeResource,
     pub cgroups_resource: CgroupsResource,
@@ -124,6 +135,7 @@ impl ResourceManagerInner {
             device_manager,
             network: None,
             share_fs: None,
+            restore_guest_interfaces: Vec::new(),
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource,
@@ -347,15 +359,41 @@ impl ResourceManagerInner {
         if let Some(network) = self.network.as_ref() {
             // Sandbox snapshot/restore: the in-guest kata-agent already has
             // interfaces/routes/neighbours configured from before the
-            // snapshot was taken. Re-issuing UpdateInterface fails because
-            // the new host tap has a fresh MAC the guest doesn't know about
-            // (and even if it matched, agent state is already populated).
-            // Skip the agent-push here; the guest will keep its pre-snapshot
-            // network identity, which is intentional for the POC.
+            // snapshot was taken. The guest's eth0 carries the
+            // pre-snapshot MAC + IP, while the new host TAP has a fresh
+            // MAC and the new pod has a fresh CNI IP. We MUST swap the
+            // guest's eth0 IP to the new pod IP, otherwise the host-side
+            // routing path lands frames at the TAP but the guest TCP
+            // stack drops them (eth0 has the old, no-longer-routable IP).
+            //
+            // Strategy: look up the guest link by its PRE-SNAPSHOT MAC
+            // (which we persisted into kata-snapshot.json at snapshot
+            // time and stashed into `restore_guest_interfaces` at restore
+            // start), flush its stale addresses, and install the new pod
+            // IP. Routes get re-pushed (default gateway may differ).
+            // Neighbours are skipped — they re-learn via ARP and a
+            // pre-snapshot neighbour list refers to host-side endpoints
+            // that no longer exist after restore.
             if restore_from_snapshot {
-                info!(sl!(),
-                    "setup_after_start_vm: skipping apply_network_to_agent (restore mode)";
-                    "sandbox" => &self.sid);
+                if self.restore_guest_interfaces.is_empty() {
+                    // No persisted snapshot-time MAC available (v1 snapshot
+                    // without guestNetwork sidecar field). Fall back to
+                    // the legacy skip — sandbox restores but keeps its
+                    // pre-snapshot IP and stays unreachable on the new
+                    // pod IP. This branch exists for back-compat with
+                    // snapshots taken before Phase C landed.
+                    warn!(sl!(),
+                        "setup_after_start_vm: restore mode without persisted guest network identity; skipping apply_network_to_agent";
+                        "sandbox" => &self.sid);
+                } else {
+                    info!(sl!(),
+                        "setup_after_start_vm: applying network to agent in restore mode";
+                        "sandbox" => &self.sid,
+                        "persisted_interfaces" => format!("{:?}", &self.restore_guest_interfaces));
+                    self.apply_network_to_agent_for_restore(network.as_ref())
+                        .await
+                        .context("apply network to agent for restore")?;
+                }
             } else {
                 self.apply_network_to_agent(network.as_ref()).await?;
             }
@@ -377,6 +415,123 @@ impl ResourceManagerInner {
             .context("handle neighbors")?;
         self.handle_routes(network).await.context("handle routes")?;
         Ok(())
+    }
+
+    /// Sandbox snapshot/restore: push the new pod's network identity
+    /// (CNI IP + routes) into the restored guest. Variant of
+    /// `apply_network_to_agent` that rewrites each interface's `hw_addr`
+    /// to the pre-snapshot MAC (looked up in
+    /// `restore_guest_interfaces` by interface name) before issuing
+    /// UpdateInterface. The agent's `update_interface` handler finds
+    /// the in-guest link by MAC, flushes its stale addresses, and
+    /// installs the request's `ip_addresses`. Neighbours are skipped
+    /// for restore — see `setup_after_start_vm` for rationale.
+    ///
+    /// Falls back gracefully when no matching pre-snapshot MAC is
+    /// found for an interface (logged + interface skipped) so a
+    /// partial sidecar doesn't fail the restore.
+    pub async fn apply_network_to_agent_for_restore(
+        &self,
+        network: &dyn Network,
+    ) -> Result<()> {
+        let interfaces = network
+            .interfaces()
+            .await
+            .context("get interfaces for restore")?;
+        for mut iface in interfaces {
+            // Find the pre-snapshot MAC for this interface by name. We
+            // rely on stable Linux interface naming inside the guest
+            // (eth0 stays eth0 across the snapshot/restore boundary).
+            let original_hw = self
+                .restore_guest_interfaces
+                .iter()
+                .find(|(name, _)| name == &iface.name)
+                .map(|(_, mac)| mac.clone());
+            let original_hw = match original_hw {
+                Some(m) => m,
+                None => {
+                    warn!(sl!(),
+                        "apply_network_to_agent_for_restore: no pre-snapshot MAC for interface; skipping";
+                        "sandbox" => &self.sid,
+                        "iface" => &iface.name);
+                    continue;
+                }
+            };
+            info!(sl!(),
+                "apply_network_to_agent_for_restore: re-IP guest interface";
+                "sandbox" => &self.sid,
+                "iface" => &iface.name,
+                "snapshot_mac" => &original_hw,
+                "new_pod_mac" => &iface.hw_addr,
+                "new_pod_ips" => format!("{:?}", &iface.ip_addresses));
+            // Substitute the new TAP MAC with the pre-snapshot MAC so
+            // the agent's find_link(LinkFilter::Address) succeeds. The
+            // agent's update_interface does NOT change the link's MAC
+            // (it only sets mtu/name/arp/up), so the guest's eth0 keeps
+            // the pre-snapshot MAC after this call — which is fine for
+            // L2 delivery via the host bridge (it learns the guest's
+            // MAC dynamically).
+            iface.hw_addr = original_hw;
+
+            let mut last_error = None;
+            for attempt in 0..10u32 {
+                match self
+                    .agent
+                    .update_interface(agent::UpdateInterfaceRequest {
+                        interface: Some(iface.clone()),
+                    })
+                    .await
+                {
+                    core::result::Result::Ok(_) => {
+                        last_error = None;
+                        break;
+                    }
+                    core::result::Result::Err(e) => {
+                        debug!(
+                            sl!(),
+                            "update_interface (restore) attempt {} failed, retrying: {:?}",
+                            attempt + 1,
+                            e
+                        );
+                        last_error = Some(e);
+                        if attempt < 9 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                return Err(err).context("update interface for restore");
+            }
+        }
+
+        // Push fresh routes (default gateway for the new pod's subnet)
+        // exactly like the non-restore path. Routes reference interfaces
+        // by name, not by MAC, so no substitution is needed.
+        self.handle_routes(network)
+            .await
+            .context("handle routes for restore")?;
+        Ok(())
+    }
+
+    /// Sandbox snapshot/restore: capture the live network state to be
+    /// persisted alongside the hypervisor snapshot. Returns a list of
+    /// `(interface_name, hw_addr)` tuples in declaration order. The
+    /// restore path consumes this via `set_restore_guest_interfaces` to
+    /// look up the in-guest links by their pre-snapshot MACs.
+    pub async fn snapshot_network_state(&self) -> Result<Vec<(String, String)>> {
+        let network = match self.network.as_ref() {
+            Some(n) => n,
+            None => return Ok(Vec::new()),
+        };
+        let interfaces = network
+            .interfaces()
+            .await
+            .context("get interfaces for snapshot")?;
+        Ok(interfaces
+            .into_iter()
+            .map(|i| (i.name, i.hw_addr))
+            .collect())
     }
 
     /// Check whether a rescan is needed at all (early-out conditions).
@@ -896,6 +1051,7 @@ impl Persist for ResourceManagerInner {
             device_manager,
             network: None,
             share_fs: None,
+            restore_guest_interfaces: Vec::new(),
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource: CgroupsResource::restore(

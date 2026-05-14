@@ -118,6 +118,30 @@ impl ResourceManager {
         inner.setup_after_start_vm(restore).await
     }
 
+    /// Sandbox snapshot/restore: capture the live guest network identity
+    /// (per-interface `(name, hw_addr)`) at snapshot time. The caller
+    /// persists the result into the kata-snapshot.json sidecar so the
+    /// restore path can re-IP the restored guest. Returns an empty Vec
+    /// when no network has been wired (e.g. host-network sandboxes).
+    pub async fn snapshot_network_state(&self) -> Result<Vec<(String, String)>> {
+        let inner = self.inner.read().await;
+        inner.snapshot_network_state().await
+    }
+
+    /// Sandbox snapshot/restore: stash the pre-snapshot `(name, hw_addr)`
+    /// list read out of the kata-snapshot.json sidecar. Must be called
+    /// before `setup_after_start_vm` for restore-mode sandboxes;
+    /// otherwise the apply-network path falls back to the no-op
+    /// behavior and the restored guest keeps its pre-snapshot IP.
+    pub async fn set_restore_guest_interfaces(
+        &self,
+        interfaces: Vec<(String, String)>,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.restore_guest_interfaces = interfaces;
+        Ok(())
+    }
+
     /// Poll the netns until interfaces exist, then configure the guest (Docker 26+).
     ///
     /// The polling phase uses a lightweight netlink scan (no endpoint creation,

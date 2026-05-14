@@ -775,6 +775,27 @@ impl Sandbox for VirtSandbox {
             // create_container / start_container, and update_linux_resource
             // skips its hypervisor resize + agent online_cpu_mem hops.
             self.resource_manager.set_restore_from_snapshot(true);
+
+            // Pull the pre-snapshot guest network identity out of the
+            // sidecar so setup_after_start_vm can look up the in-guest
+            // links by their original MACs and re-IP eth0 to the new
+            // pod's CNI address. Best-effort: a v1 sidecar without the
+            // (optional) guestNetwork field leaves the resource manager
+            // with an empty list, which causes the apply-network path
+            // to fall back to its legacy no-op skip — restored guest
+            // keeps its pre-snapshot IP and is unreachable on the new
+            // pod IP (intentional fallback, not a regression).
+            if let Err(e) = load_and_stash_snapshot_guest_network(
+                snapshot_src,
+                &self.resource_manager,
+            )
+            .await
+            {
+                warn!(sl!(),
+                    "sandbox start (restore): failed to load guest network sidecar: {e:#}";
+                    "sandbox" => id,
+                    "snapshot_src" => snapshot_src);
+            }
         }
 
         // generate device and setup before start vm
@@ -1066,9 +1087,27 @@ impl Sandbox for VirtSandbox {
 
         snap_result?;
 
+        // Capture the pre-snapshot guest network identity so the restore
+        // path can look up the in-guest links by their original MACs
+        // and re-IP eth0 to the new pod's CNI address. Failures here
+        // are tolerable (snapshot still usable, just missing the
+        // optional re-IP hint) so we log+continue instead of erroring.
+        let guest_network = match self.resource_manager.snapshot_network_state().await {
+            Ok(ifaces) => Some(ifaces),
+            Err(e) => {
+                warn!(sl!(),
+                    "snapshot: failed to capture guest network state for sidecar: {e:#}";
+                    "sandbox" => &self.sid);
+                None
+            }
+        };
+
         // Write the kata-snapshot.json sidecar last (matches the Go runtime's
         // schema exactly so a Go-side restore can consume what we wrote).
-        let manifest = serde_json::json!({
+        // `guestNetwork` is a Rust-runtime extension: optional field, ignored
+        // by Go's strict-version-only LoadSnapshotManifest, populated for
+        // restore re-IP. Manifest version stays at 1 (BC).
+        let mut manifest = serde_json::json!({
             "version": 1,
             "sandboxID": self.sid,
             "hypervisorType": "clh",
@@ -1078,6 +1117,17 @@ impl Sandbox for VirtSandbox {
             ),
             "containerIDs": serde_json::Value::Array(Vec::new()),
         });
+        if let Some(ifaces) = guest_network.as_ref() {
+            let ifaces_json: Vec<serde_json::Value> = ifaces
+                .iter()
+                .map(|(name, hw_addr)| {
+                    serde_json::json!({"name": name, "hwAddr": hw_addr})
+                })
+                .collect();
+            manifest["guestNetwork"] = serde_json::json!({
+                "interfaces": ifaces_json,
+            });
+        }
         let manifest_path = Path::new(dest_dir).join("kata-snapshot.json");
         std::fs::write(
             &manifest_path,
@@ -1255,6 +1305,78 @@ impl Sandbox for VirtSandbox {
 
         Ok(())
     }
+}
+
+/// Sandbox snapshot/restore: parse the `guestNetwork.interfaces` section
+/// of a kata-snapshot.json sidecar and stash the resulting `(name,
+/// hwAddr)` list into the resource manager so post-restore
+/// setup_after_start_vm can re-IP the guest. Returns Ok(()) for v1
+/// sidecars missing the optional field (back-compat with pre-Phase-C
+/// snapshots); errors are reserved for I/O / JSON parse failures or a
+/// malformed (non-array, missing string fields) `interfaces` block.
+async fn load_and_stash_snapshot_guest_network(
+    snapshot_src: &str,
+    resource_manager: &ResourceManager,
+) -> Result<()> {
+    let manifest_path = Path::new(snapshot_src).join("kata-snapshot.json");
+    let data = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&data)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+    let interfaces = match v.get("guestNetwork").and_then(|gn| gn.get("interfaces")) {
+        Some(serde_json::Value::Array(arr)) => arr,
+        Some(serde_json::Value::Null) | None => {
+            // Pre-Phase-C v1 sidecar without the optional field. Nothing
+            // to stash; the apply-network path will fall back to skip.
+            info!(sl!(),
+                "load_and_stash_snapshot_guest_network: sidecar has no guestNetwork field; skipping";
+                "snapshot_src" => snapshot_src);
+            return Ok(());
+        }
+        Some(other) => {
+            return Err(anyhow!(
+                "kata-snapshot.json {} has guestNetwork.interfaces of unexpected type {:?}",
+                manifest_path.display(),
+                other
+            ));
+        }
+    };
+
+    let mut out: Vec<(String, String)> = Vec::with_capacity(interfaces.len());
+    for (i, iface) in interfaces.iter().enumerate() {
+        let name = iface
+            .get("name")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "kata-snapshot.json {} guestNetwork.interfaces[{i}] missing string `name`",
+                    manifest_path.display()
+                )
+            })?
+            .to_string();
+        let hw_addr = iface
+            .get("hwAddr")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "kata-snapshot.json {} guestNetwork.interfaces[{i}] missing string `hwAddr`",
+                    manifest_path.display()
+                )
+            })?
+            .to_string();
+        out.push((name, hw_addr));
+    }
+
+    info!(sl!(),
+        "load_and_stash_snapshot_guest_network: stashed pre-snapshot interfaces";
+        "snapshot_src" => snapshot_src,
+        "interfaces" => format!("{:?}", &out));
+    resource_manager
+        .set_restore_guest_interfaces(out)
+        .await
+        .context("set restore guest interfaces")?;
+    Ok(())
 }
 
 #[async_trait]
