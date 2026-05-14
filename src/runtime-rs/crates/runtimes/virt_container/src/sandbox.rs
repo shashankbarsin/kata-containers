@@ -1058,7 +1058,10 @@ impl Sandbox for VirtSandbox {
         // Best-effort resume on every exit path. We log resume failures but
         // do not let them shadow a more interesting snapshot error.
         if let Err(rerr) = self.hypervisor.resume_vm().await {
-            warn!(sl!(), "failed to resume VM after snapshot"; "error" => format!("{rerr:#}"));
+            warn!(sl!(), "failed to resume VM after snapshot: {rerr:#}";
+                  "error" => format!("{rerr:#}"));
+        } else {
+            info!(sl!(), "snapshot: VM resumed successfully");
         }
 
         snap_result?;

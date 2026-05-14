@@ -117,7 +117,7 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn save_vm(&self, dest_dir: &str) -> Result<()> {
-        let inner = self.inner.write().await;
+        let mut inner = self.inner.write().await;
         inner.save_vm(dest_dir).await
     }
 

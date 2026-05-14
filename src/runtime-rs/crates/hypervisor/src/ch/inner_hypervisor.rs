@@ -760,6 +760,16 @@ impl CloudHypervisorInner {
         if self.restore_src.is_some() {
             info!(sl!(), "start_vm: skipping boot_vm (restore mode)";
                   "sandbox" => &self.id);
+            // CLH leaves vCPUs paused after --restore. Issue an explicit
+            // /vm.resume so the kata-agent vsock listener wakes up and
+            // subsequent agent grpcs (or short-circuits) can proceed.
+            // Without this, the shim hangs in subsequent Task/State calls
+            // because no in-guest process makes progress.
+            info!(sl!(), "start_vm: post-restore resume";
+                  "sandbox" => &self.id);
+            cloud_hypervisor_vm_resume(&self.api_socket)
+                .await
+                .context("post-restore resume_vm")?;
         } else {
             self.boot_vm().await?;
         }
@@ -916,7 +926,7 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn save_vm(&self, dest_dir: &str) -> Result<()> {
+    pub(crate) async fn save_vm(&mut self, dest_dir: &str) -> Result<()> {
         // AKS Pod Snapshot POC (Phase C2/C3.1): port of the Go runtime's SaveVM().
         // The caller is responsible for having paused the VM first; this method
         // only invokes /vm.snapshot with the requested destination directory.
@@ -939,6 +949,46 @@ impl CloudHypervisorInner {
         cloud_hypervisor_vm_snapshot(&self.api_socket, &url)
             .await
             .with_context(|| format!("cloud_hypervisor_vm_snapshot to {url}"))?;
+
+        // CLH closes the keep-alive HTTP connection after a long /vm.snapshot
+        // response (observed on v48 with multi-hundred-MiB guests). Reset our
+        // persistent api_socket here so the post-save resume_vm gets a fresh
+        // connection. Without this, the next API call (typically resume_vm)
+        // fails with a closed-socket error and the workload gets killed by
+        // the supervisor.
+        if let Err(e) = self.reset_api_connection().await {
+            warn!(sl!(), "save_vm: reset_api_connection failed (resume_vm will likely fail too)";
+                  "sandbox" => &self.id,
+                  "error" => format!("{e:#}"));
+        }
+        Ok(())
+    }
+
+    /// Sandbox snapshot/restore: re-connect to the cloud-hypervisor API
+    /// socket, dropping the persistent UnixStream we keep on `self.api_socket`
+    /// and replacing it with a fresh connection to the same path.
+    ///
+    /// Why this exists: every CH HTTP wrapper in `ch_api.rs` does
+    /// `try_clone()` on the persistent socket, so all calls share the same
+    /// underlying TCP-equivalent (Unix) connection. That works for short
+    /// PUTs (vm.create, vm.boot, vm.add-net, vm.pause, vm.resume) but
+    /// `/vm.snapshot` for a 384 MiB guest takes seconds to write to disk,
+    /// and observation on the v48 cloud-hypervisor in our POC shows the
+    /// server closes the keep-alive connection after that response. Subsequent
+    /// calls (the post-snapshot resume_vm in particular) then fail with a
+    /// closed-socket error. The Go runtime sidesteps this by opening a fresh
+    /// connection per call; until we restructure ch_api.rs the same way, this
+    /// targeted reset is what `Sandbox.snapshot` calls between save_vm and
+    /// resume_vm to keep the VM live.
+    pub(crate) async fn reset_api_connection(&mut self) -> Result<()> {
+        let api_socket_path = get_api_socket_path(&self.id)?;
+        let new_sock = task::spawn_blocking(move || -> Result<UnixStream> {
+            UnixStream::connect(&api_socket_path).with_context(|| {
+                format!("reconnect to CH api socket {api_socket_path:?}")
+            })
+        })
+        .await??;
+        *self.api_socket.lock().await = Some(new_sock);
         Ok(())
     }
 
