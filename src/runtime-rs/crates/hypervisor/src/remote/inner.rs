@@ -241,7 +241,7 @@ impl RemoteInner {
         todo!()
     }
 
-    pub(crate) async fn save_vm(&self) -> Result<()> {
+    pub(crate) async fn save_vm(&self, _dest_dir: &str) -> Result<()> {
         warn!(sl!(), "RemoteInner::save_vm(): NOT YET IMPLEMENTED");
         todo!()
     }

@@ -131,9 +131,9 @@ impl Hypervisor for Dragonball {
         inner.resume_vm()
     }
 
-    async fn save_vm(&self) -> Result<()> {
+    async fn save_vm(&self, dest_dir: &str) -> Result<()> {
         let inner = self.inner.read().await;
-        inner.save_vm().await
+        inner.save_vm(dest_dir).await
     }
 
     // returns Result<(old_vcpus, new_vcpus)>

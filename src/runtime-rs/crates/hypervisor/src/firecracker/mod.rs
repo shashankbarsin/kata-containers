@@ -105,9 +105,9 @@ impl Hypervisor for Firecracker {
         inner.resume_vm()
     }
 
-    async fn save_vm(&self) -> Result<()> {
+    async fn save_vm(&self, dest_dir: &str) -> Result<()> {
         let inner = self.inner.read().await;
-        inner.save_vm().await
+        inner.save_vm(dest_dir).await
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {

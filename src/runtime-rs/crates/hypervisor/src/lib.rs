@@ -133,7 +133,12 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn stop_vm(&self) -> Result<()>;
     async fn wait_vm(&self) -> Result<i32>;
     async fn pause_vm(&self) -> Result<()>;
-    async fn save_vm(&self) -> Result<()>;
+    // AKS Pod Snapshot POC (Phase C3.1): save_vm now takes the destination
+    // directory the hypervisor should write its state into. Backends that
+    // ignore the argument (qemu uses vm_template config, firecracker/dragonball
+    // are stubs) accept it but don't act on it; the CH backend uses it to
+    // build the `file://...` destination URL passed to /vm.snapshot.
+    async fn save_vm(&self, dest_dir: &str) -> Result<()>;
     async fn resume_vm(&self) -> Result<()>;
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)>; // returns (old_vcpus, new_vcpus)
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)>;

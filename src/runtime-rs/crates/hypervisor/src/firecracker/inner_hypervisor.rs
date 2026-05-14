@@ -130,7 +130,7 @@ impl FcInner {
         Ok(())
     }
 
-    pub(crate) async fn save_vm(&self) -> Result<()> {
+    pub(crate) async fn save_vm(&self, _dest_dir: &str) -> Result<()> {
         warn!(sl(), "Save VM: Not implemented");
         Ok(())
     }

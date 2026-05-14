@@ -705,14 +705,17 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn save_vm(&self) -> Result<()> {
-        // AKS Pod Snapshot POC (Phase C2): port of the Go runtime's SaveVM().
-        // The Go implementation mirrors the qemu Save contract: the caller has
-        // already paused the VM, and SaveVM is responsible only for invoking
-        // /vm.snapshot with a destination directory. The directory layout
-        // matches what `cloud-hypervisor --restore source_url=...` expects.
-        let dest_dir = std::path::Path::new(&self.run_dir).join("snapshot");
-        std::fs::create_dir_all(&dest_dir).with_context(|| {
+    pub(crate) async fn save_vm(&self, dest_dir: &str) -> Result<()> {
+        // AKS Pod Snapshot POC (Phase C2/C3.1): port of the Go runtime's SaveVM().
+        // The caller is responsible for having paused the VM first; this method
+        // only invokes /vm.snapshot with the requested destination directory.
+        // The directory layout matches what `cloud-hypervisor --restore
+        // source_url=file://...` expects on the restore side.
+        if dest_dir.is_empty() {
+            return Err(anyhow!("save_vm: dest_dir is required"));
+        }
+        let dest_dir = std::path::Path::new(dest_dir);
+        std::fs::create_dir_all(dest_dir).with_context(|| {
             format!(
                 "save_vm: create snapshot destination {}",
                 dest_dir.display()

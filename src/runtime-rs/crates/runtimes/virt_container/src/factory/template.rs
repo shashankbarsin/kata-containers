@@ -166,7 +166,11 @@ impl Template {
 
         vm.pause().await.context("pause template vm")?;
 
-        vm.save().await.context("save template vm")?;
+        // The template factory stores VM state via the qemu vm_template config
+        // (memory_path / device_state_path on self.state_path); pass an empty
+        // dest_dir so the qemu backend uses that path. Other backends ignore
+        // dest_dir for save_vm today, so this is a no-op for them.
+        vm.save("").await.context("save template vm")?;
 
         Ok(())
     }

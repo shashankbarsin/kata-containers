@@ -984,13 +984,6 @@ impl Sandbox for VirtSandbox {
     //      failure so a failed checkpoint doesn't leave the sandbox stuck.
     //   4. Write a kata-snapshot.json sidecar last so its presence implies
     //      the snapshot directory is complete and consumable by restore.
-    //
-    // dest_dir is the directory the hypervisor writes its artifacts into;
-    // because the Hypervisor::save_vm contract in runtime-rs encodes its own
-    // destination (run_dir/snapshot) we ignore dest_dir for the hypervisor
-    // step itself and only use it as the location for the sidecar manifest.
-    // This keeps wire-compat with the Go shim while letting the hypervisor
-    // backend choose where on disk it stores binary state.
     async fn snapshot(&self, dest_dir: &str) -> Result<()> {
         if dest_dir.is_empty() {
             return Err(anyhow!("Sandbox.snapshot: dest_dir is required"));
@@ -1007,7 +1000,11 @@ impl Sandbox for VirtSandbox {
             .await
             .context("pausing VM for snapshot")?;
 
-        let snap_result = self.hypervisor.save_vm().await.context("snapshotting VM");
+        let snap_result = self
+            .hypervisor
+            .save_vm(dest_dir)
+            .await
+            .context("snapshotting VM");
 
         // Best-effort resume on every exit path. We log resume failures but
         // do not let them shadow a more interesting snapshot error.

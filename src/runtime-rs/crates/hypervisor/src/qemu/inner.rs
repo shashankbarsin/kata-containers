@@ -487,7 +487,7 @@ impl QemuInner {
         qmp.qmp_cont().context("resume vm")
     }
 
-    pub(crate) async fn save_vm(&mut self) -> Result<()> {
+    pub(crate) async fn save_vm(&mut self, _dest_dir: &str) -> Result<()> {
         let qmp = self.qmp.as_mut().ok_or(anyhow!("QMP not initialized"))?;
 
         if self.config.vm_template.boot_to_be_template {
