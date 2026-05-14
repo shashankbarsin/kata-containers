@@ -835,9 +835,20 @@ func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 		ctx = context.WithValue(ctx, customRequestTimeoutKey, remoteRequestTimeout)
 	}
 
+	// AKS Pod Snapshot POC: for restore sandboxes the kata-agent inside the
+	// guest already received CreateSandbox before the snapshot was taken,
+	// so we MUST NOT re-issue setupNetworks / CreateSandboxRequest here.
+	// We still verify the grpc server is serving via check().
+	isRestore := sandbox.config.HypervisorConfig.RestoreFromSnapshot
+
 	// Check grpc server is serving
 	if err = k.check(ctx); err != nil {
 		return err
+	}
+
+	if isRestore {
+		k.Logger().Warn("AKS Pod Snapshot: startSandbox skipping setupNetworks / CreateSandboxRequest in restore mode")
+		return nil
 	}
 
 	// If a Policy has been specified, send it to the agent.
@@ -1371,6 +1382,19 @@ func (k *kataAgent) setupNetworks(ctx context.Context, sandbox *Sandbox, c *Cont
 func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Container) (p *Process, err error) {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "createContainer", kataAgentTracingTags)
 	defer span.End()
+
+	// AKS Pod Snapshot POC: in restore mode the guest kata-agent already has
+	// the original container running (its process tree was captured in the
+	// snapshot). Issuing CreateContainerRequest with the same id would race
+	// with the agent's existing state and CreateContainerRequest currently
+	// hangs. Skip the grpc call and synthesize a Process so the shim can
+	// report container readiness to containerd.
+	if sandbox.config.HypervisorConfig.RestoreFromSnapshot {
+		k.Logger().WithField("container", c.id).
+			Warn("AKS Pod Snapshot: createContainer short-circuited in restore mode (container already exists in agent)")
+		return buildProcessFromExecID(c.id)
+	}
+
 	var ctrStorages []*grpc.Storage
 	var ctrDevices []*grpc.Device
 	var sharedRootfs *SharedFile
@@ -1991,6 +2015,15 @@ func (k *kataAgent) handlePidNamespace(grpcSpec *grpc.Spec, sandbox *Sandbox) bo
 func (k *kataAgent) startContainer(ctx context.Context, sandbox *Sandbox, c *Container) error {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "startContainer", kataAgentTracingTags)
 	defer span.End()
+
+	// AKS Pod Snapshot POC: in restore mode the container is already
+	// running inside the guest (captured in the snapshot). Skip the
+	// StartContainerRequest grpc call.
+	if sandbox.config.HypervisorConfig.RestoreFromSnapshot {
+		k.Logger().WithField("container", c.id).
+			Warn("AKS Pod Snapshot: startContainer short-circuited in restore mode (container already running in guest)")
+		return nil
+	}
 
 	req := &grpc.StartContainerRequest{
 		ContainerId: c.id,
