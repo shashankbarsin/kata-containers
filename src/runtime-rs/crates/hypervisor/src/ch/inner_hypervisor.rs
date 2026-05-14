@@ -7,9 +7,11 @@ use super::inner::CloudHypervisorInner;
 use crate::ch::utils::get_api_socket_path;
 use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
+use crate::device::DeviceType;
 use crate::kernel_param::KernelParams;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
+use crate::utils::open_named_tuntap;
 use crate::utils::remove_dir_all_if_exists;
 use crate::utils::set_groups;
 use crate::utils::vm_cleanup;
@@ -30,6 +32,7 @@ use ch_config::{
 use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, VmConfig};
 use core::future::poll_fn;
 use futures::future::join_all;
+use kata_sys_util::netns::NetnsGuard;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
@@ -736,6 +739,17 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn start_vm(&mut self, timeout_secs: i32) -> Result<()> {
         self.timeout_secs = timeout_secs;
+
+        // Sandbox snapshot/restore: in restore mode, the new sandbox's net
+        // devices have been queued on pending_devices via add_device() but
+        // boot_vm (which would normally drain them) is skipped because CLH
+        // does CreateVM+BootVM internally during --restore. Drain them now,
+        // open the host tap fds, and stash them so cloud_hypervisor_launch
+        // can pass them to the child via `--restore net_fds=[<id>@<fd>,...]`.
+        if self.restore_src.is_some() {
+            self.finalize_restore_pending_devices().await?;
+        }
+
         self.start_hypervisor(self.timeout_secs).await?;
 
         self.state = VmmState::VmmServerReady;
@@ -752,6 +766,113 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::VmRunning;
 
+        Ok(())
+    }
+
+    /// Sandbox snapshot/restore: drain pending net devices into the
+    /// `restore_net_fds` slot so cloud_hypervisor_launch can pass them to
+    /// the child via `--restore net_fds=[<id>@<fd>,...]`. Called from
+    /// start_vm() before start_hypervisor() when restore_src is armed.
+    ///
+    /// In the normal boot path get_shared_devices() is what drains
+    /// pending_devices into the boot-time VmConfig + post-boot
+    /// /vm.netdev.add HTTP calls; that path is skipped in restore mode
+    /// because CLH does CreateVM+BootVM internally during --restore. So we
+    /// take ownership of the queued net devices here, open their host tap
+    /// fds in the destination netns, and pair the resulting File handles
+    /// with the snapshot's declared net device IDs (in declaration order).
+    ///
+    /// Non-net pending devices (ShareFs, Vfio, Protection) are part of the
+    /// snapshot's CH state and must not be re-added; they are dropped here
+    /// with a log line.
+    async fn finalize_restore_pending_devices(&mut self) -> Result<()> {
+        let restore_src = self
+            .restore_src
+            .as_ref()
+            .ok_or_else(|| anyhow!("finalize_restore_pending_devices: not in restore mode"))?
+            .clone();
+
+        let config_path = std::path::Path::new(&restore_src).join("config.json");
+        let snap_nets =
+            crate::ch::snapshot_rewrite::read_snapshot_net_ids(&config_path)
+                .context("reading snapshot net ids for restore")?;
+
+        // Drain pending devices. Net devices contribute tap fds; everything
+        // else is already captured in the snapshot and must not be re-added.
+        let pending = std::mem::take(&mut self.pending_devices);
+        let queues = self.config.network_info.network_queues as usize;
+
+        // Open all host taps inside the destination netns so they live in
+        // the network namespace the restored guest expects. NetnsGuard is
+        // RAII and restores the caller's netns when dropped at function
+        // end (the File handles outlive the guard, which is fine -- a tap
+        // fd's network namespace is fixed at open time).
+        let netns = self.netns.clone().unwrap_or_default();
+        let mut all_files: Vec<std::fs::File> = Vec::new();
+        let mut net_count = 0usize;
+        {
+            let _netns_guard =
+                NetnsGuard::new(&netns).context("enter netns for restore tap open")?;
+            for dev in pending {
+                match dev {
+                    DeviceType::Network(net_device) => {
+                        net_count += 1;
+                        let mut files = open_named_tuntap(
+                            &net_device.config.host_dev_name,
+                            queues as u32,
+                        )
+                        .context("open named tuntap for restore")?;
+                        all_files.append(&mut files);
+                    }
+                    other => {
+                        info!(sl!(),
+                            "finalize_restore_pending_devices: dropping non-net pending device (already in snapshot)";
+                            "sandbox" => &self.id,
+                            "device" => format!("{:?}", other));
+                    }
+                }
+            }
+        }
+
+        if snap_nets.len() != net_count {
+            return Err(anyhow!(
+                "snapshot has {} net device(s) but new sandbox queued {}",
+                snap_nets.len(),
+                net_count
+            ));
+        }
+        let total_expected: usize = snap_nets.iter().map(|n| n.num_fds).sum();
+        if total_expected != all_files.len() {
+            return Err(anyhow!(
+                "snapshot expects {} fd(s) total but new sandbox opened {}",
+                total_expected,
+                all_files.len()
+            ));
+        }
+
+        // Pair flat file list with snapshot net IDs in declaration order.
+        // For each device, snap_nets[i].num_fds files contribute pairs
+        // (snap_nets[i].id, file). Ordering relies on the new sandbox's
+        // add_device(Network) calls happening in the same OCI/CNI-derived
+        // order as the original sandbox -- the same assumption the Go
+        // runtime relies on (clh.go::buildRestoreArgs).
+        let mut paired: Vec<(String, std::fs::File)> = Vec::with_capacity(all_files.len());
+        let mut file_iter = all_files.into_iter();
+        for n in &snap_nets {
+            for _ in 0..n.num_fds {
+                let f = file_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("ran out of restore tap fds while pairing"))?;
+                paired.push((n.id.clone(), f));
+            }
+        }
+
+        info!(sl!(), "finalize_restore_pending_devices: armed";
+            "sandbox" => &self.id,
+            "net_devices" => net_count,
+            "fds" => paired.len());
+
+        self.restore_net_fds = paired;
         Ok(())
     }
 
