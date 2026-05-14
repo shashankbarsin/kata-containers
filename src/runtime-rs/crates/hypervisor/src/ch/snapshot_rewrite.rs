@@ -81,15 +81,25 @@ pub(crate) fn read_snapshot_net_ids(config_path: &Path) -> Result<Vec<SnapshotNe
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("snapshot config net[{i}] missing string `id`"))?
             .to_string();
-        let num_fds = match n.get("fds") {
-            Some(serde_json::Value::Array(arr)) => arr.len(),
-            // Snapshots taken from a config that supplied no fds field at all.
-            Some(serde_json::Value::Null) | None => 0,
-            Some(other) => {
-                return Err(anyhow!(
-                    "snapshot config net[{i}] `fds` is not an array: {:?}",
-                    other
-                ));
+        // CLH expects `fds.len() == num_queues` at restore time. The snapshot
+        // serialises `fds: [-1]` as a placeholder regardless of how many
+        // queues the original device had, so reading `fds.len()` undercounts
+        // for multi-queue devices and the restore validation rejects with
+        // RestoreMissingRequiredNetId. Use `num_queues` as the source of
+        // truth, falling back to fds.len() for older snapshots that may
+        // not carry it.
+        let num_fds = if let Some(nq) = n.get("num_queues").and_then(|v| v.as_u64()) {
+            nq as usize
+        } else {
+            match n.get("fds") {
+                Some(serde_json::Value::Array(arr)) => arr.len(),
+                Some(serde_json::Value::Null) | None => 0,
+                Some(other) => {
+                    return Err(anyhow!(
+                        "snapshot config net[{i}] `fds` is not an array: {:?}",
+                        other
+                    ));
+                }
             }
         };
         out.push(SnapshotNetId { id, num_fds });
@@ -97,16 +107,22 @@ pub(crate) fn read_snapshot_net_ids(config_path: &Path) -> Result<Vec<SnapshotNe
     Ok(out)
 }
 
-/// Rewrites `config_path` in place, replacing every occurrence of
-/// `/run/vc/vm/<old-sandbox-id>/` with `/run/vc/vm/<new_id>/`. CLH bakes
-/// absolute paths for sandbox-local sockets (vsock, virtiofsd) into the
-/// snapshot config; without this rewrite /vm.restore would bind/connect
-/// against the original sandbox's runtime dir.
+/// Rewrites `config_path` in place, replacing every occurrence of the
+/// snapshot-time per-sandbox runtime dir prefix (e.g. `/run/kata/<old>/`
+/// for runtime-rs or `/run/vc/vm/<old>/` for the Go runtime) with the
+/// equivalent prefix for `new_id`. CLH bakes absolute paths for
+/// sandbox-local sockets (vsock, virtiofsd) into the snapshot config;
+/// without this rewrite /vm.restore would bind/connect against the
+/// original sandbox's runtime dir.
 ///
-/// The substitution is purely textual on the `/run/vc/vm/` prefix. If the
-/// snapshot contains no such paths (e.g. a sandbox without virtio-fs or a
-/// custom vsock path) the function is a no-op. If the embedded id already
-/// matches `new_id` the function is also a no-op.
+/// The substitution is purely textual. If the snapshot contains no such
+/// paths (e.g. a sandbox without virtio-fs or a custom vsock path) the
+/// function is a no-op. If the embedded id already matches `new_id` the
+/// function is also a no-op.
+///
+/// Both runtimes' prefixes are tried; whichever appears first in the
+/// config is used as the substitution base. (A snapshot only ever
+/// contains one runtime's paths, so there's no ambiguity.)
 pub(crate) fn rewrite_snapshot_config_for_new_sandbox(
     config_path: &Path,
     new_id: &str,
@@ -114,13 +130,20 @@ pub(crate) fn rewrite_snapshot_config_for_new_sandbox(
     let data = std::fs::read(config_path)
         .with_context(|| format!("reading snapshot config {}", config_path.display()))?;
 
-    const VM_DIR_PREFIX: &[u8] = b"/run/vc/vm/";
-
-    let idx = match find_subslice(&data, VM_DIR_PREFIX) {
-        Some(i) => i,
+    // Try both runtime-rs (`/run/kata/`) and Go-runtime (`/run/vc/vm/`)
+    // prefixes. Whichever appears first wins.
+    const PREFIXES: &[&[u8]] = &[b"/run/kata/", b"/run/vc/vm/"];
+    let (prefix, idx) = match PREFIXES
+        .iter()
+        .filter_map(|p| find_subslice(&data, p).map(|i| (*p, i)))
+        .min_by_key(|(_, i)| *i)
+    {
+        Some(hit) => hit,
         None => return Ok(()),
     };
-    let after = &data[idx + VM_DIR_PREFIX.len()..];
+    let prefix_str = std::str::from_utf8(prefix).expect("ascii");
+
+    let after = &data[idx + prefix.len()..];
     // The sandbox id ends at the next `/` or `"`.
     let end = after
         .iter()
@@ -138,8 +161,8 @@ pub(crate) fn rewrite_snapshot_config_for_new_sandbox(
         return Ok(());
     }
 
-    let needle = format!("/run/vc/vm/{old_id}/");
-    let replacement = format!("/run/vc/vm/{new_id}/");
+    let needle = format!("{prefix_str}{old_id}/");
+    let replacement = format!("{prefix_str}{new_id}/");
     let patched = replace_bytes(&data, needle.as_bytes(), replacement.as_bytes());
 
     let tmp = config_path.with_extension("json.tmp");

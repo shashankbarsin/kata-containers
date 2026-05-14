@@ -427,24 +427,70 @@ impl CloudHypervisorInner {
         // io::Error.
         if !net_fd_raws.is_empty() {
             let raws = net_fd_raws.clone();
+            let dbg_path: std::ffi::CString =
+                std::ffi::CString::new("/tmp/kata-rs-dup2.log").expect("valid cstr");
             // Safety: pre_exec runs after fork in the child; libc calls here
             // touch only the child's fd table.
             unsafe {
                 let _ = cmd.pre_exec(move || {
+                    // Open a debug file in the child to verify the closure runs.
+                    // We can't use slog/info! here because logging bridges may
+                    // not be fork-safe; raw libc::open + write is sufficient.
+                    let dbg_fd = libc::open(
+                        dbg_path.as_ptr(),
+                        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT,
+                        0o644,
+                    );
+                    let log = |msg: &str| {
+                        if dbg_fd >= 0 {
+                            let _ = libc::write(dbg_fd, msg.as_ptr() as *const _, msg.len());
+                        }
+                    };
+                    log("pre_exec dup2: start\n");
+
                     for (idx, &fd) in raws.iter().enumerate() {
                         let target: std::os::unix::io::RawFd = 3 + idx as i32;
+                        let line = format!("pre_exec dup2: idx={idx} fd={fd} target={target}\n");
+                        log(&line);
                         if fd != target {
                             if libc::dup2(fd, target) < 0 {
-                                return Err(std::io::Error::last_os_error());
+                                let e = std::io::Error::last_os_error();
+                                log(&format!("pre_exec dup2: FAIL dup2: {e}\n"));
+                                if dbg_fd >= 0 {
+                                    libc::close(dbg_fd);
+                                }
+                                return Err(e);
                             }
                         }
                         let flags = libc::fcntl(target, libc::F_GETFD);
                         if flags < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            let e = std::io::Error::last_os_error();
+                            log(&format!("pre_exec dup2: FAIL F_GETFD: {e}\n"));
+                            if dbg_fd >= 0 {
+                                libc::close(dbg_fd);
+                            }
+                            return Err(e);
                         }
                         if libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            let e = std::io::Error::last_os_error();
+                            log(&format!("pre_exec dup2: FAIL F_SETFD: {e}\n"));
+                            if dbg_fd >= 0 {
+                                libc::close(dbg_fd);
+                            }
+                            return Err(e);
                         }
+                        // Verify the target fd is what we expect.
+                        let mut st: libc::stat = std::mem::zeroed();
+                        if libc::fstat(target, &mut st) == 0 {
+                            log(&format!(
+                                "pre_exec dup2: OK target={target} mode=0o{:o} ino={}\n",
+                                st.st_mode, st.st_ino
+                            ));
+                        }
+                    }
+                    log("pre_exec dup2: done\n");
+                    if dbg_fd >= 0 {
+                        libc::close(dbg_fd);
                     }
                     Ok(())
                 });
@@ -505,6 +551,20 @@ impl CloudHypervisorInner {
         }
 
         debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
+
+        // Sandbox snapshot/restore: log net fd plumbing for restore mode so
+        // we can diagnose mismatches between what the shim opens and what
+        // CLH receives at child fd 3+.
+        if !net_fd_raws.is_empty() {
+            info!(sl!(), "spawn: net fd plumbing raws={:?} count={}", net_fd_raws, net_fd_raws.len());
+            for (i, &fd) in net_fd_raws.iter().enumerate() {
+                let kind = match nix::sys::stat::fstat(fd) {
+                    Ok(s) => format!("mode=0o{:o} ino={}", s.st_mode, s.st_ino),
+                    Err(e) => format!("fstat-err={e}"),
+                };
+                info!(sl!(), "spawn: parent fd idx={} fd={} {}", i, fd, kind);
+            }
+        }
 
         let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
 
@@ -810,7 +870,32 @@ impl CloudHypervisorInner {
         // Drain pending devices. Net devices contribute tap fds; everything
         // else is already captured in the snapshot and must not be re-added.
         let pending = std::mem::take(&mut self.pending_devices);
-        let queues = self.config.network_info.network_queues as usize;
+
+        // Filter and count net devices first, so we can pair each device
+        // with the snapshot's required num_fds (which dictates how many
+        // tap queues we need to open). Using the current TOML's
+        // network_queues here would mismatch when the snapshot was taken
+        // with a different num_queues.
+        let mut net_devs: Vec<crate::NetworkDevice> = Vec::new();
+        for dev in pending {
+            match dev {
+                DeviceType::Network(net_device) => net_devs.push(net_device),
+                other => {
+                    info!(sl!(),
+                        "finalize_restore_pending_devices: dropping non-net pending device (already in snapshot)";
+                        "sandbox" => &self.id,
+                        "device" => format!("{:?}", other));
+                }
+            }
+        }
+        let net_count = net_devs.len();
+        if snap_nets.len() != net_count {
+            return Err(anyhow!(
+                "snapshot has {} net device(s) but new sandbox queued {}",
+                snap_nets.len(),
+                net_count
+            ));
+        }
 
         // Open all host taps inside the destination netns so they live in
         // the network namespace the restored guest expects. NetnsGuard is
@@ -819,37 +904,27 @@ impl CloudHypervisorInner {
         // fd's network namespace is fixed at open time).
         let netns = self.netns.clone().unwrap_or_default();
         let mut all_files: Vec<std::fs::File> = Vec::new();
-        let mut net_count = 0usize;
         {
             let _netns_guard =
                 NetnsGuard::new(&netns).context("enter netns for restore tap open")?;
-            for dev in pending {
-                match dev {
-                    DeviceType::Network(net_device) => {
-                        net_count += 1;
-                        let mut files = open_named_tuntap(
-                            &net_device.config.host_dev_name,
-                            queues as u32,
-                        )
-                        .context("open named tuntap for restore")?;
-                        all_files.append(&mut files);
-                    }
-                    other => {
-                        info!(sl!(),
-                            "finalize_restore_pending_devices: dropping non-net pending device (already in snapshot)";
-                            "sandbox" => &self.id,
-                            "device" => format!("{:?}", other));
-                    }
-                }
+            for (idx, net_device) in net_devs.iter().enumerate() {
+                // CLH expects num_queues fds for this device; snap_nets[idx]
+                // carries that count from the snapshot config (taken from
+                // its `num_queues` field, falling back to `fds.len()`).
+                let queues_needed = snap_nets[idx].num_fds.max(1) as u32;
+                info!(sl!(),
+                    "finalize_restore_pending_devices: opening tap";
+                    "sandbox" => &self.id,
+                    "host_dev_name" => &net_device.config.host_dev_name,
+                    "queues" => queues_needed,
+                    "snap_net_id" => &snap_nets[idx].id);
+                let mut files = open_named_tuntap(
+                    &net_device.config.host_dev_name,
+                    queues_needed,
+                )
+                .context("open named tuntap for restore")?;
+                all_files.append(&mut files);
             }
-        }
-
-        if snap_nets.len() != net_count {
-            return Err(anyhow!(
-                "snapshot has {} net device(s) but new sandbox queued {}",
-                snap_nets.len(),
-                net_count
-            ));
         }
         let total_expected: usize = snap_nets.iter().map(|n| n.num_fds).sum();
         if total_expected != all_files.len() {
@@ -908,7 +983,14 @@ impl CloudHypervisorInner {
         Ok(0)
     }
 
-    pub(crate) async fn pause_vm(&self) -> Result<()> {
+    pub(crate) async fn pause_vm(&mut self) -> Result<()> {
+        // Sandbox snapshot/restore: reset api socket before each call so a
+        // prior keep-alive response's leftover bytes can't bleed into the
+        // next request's HTTP parser. See `save_vm` / `reset_api_connection`
+        // for the full rationale.
+        if let Err(e) = self.reset_api_connection().await {
+            warn!(sl!(), "pause_vm: reset_api_connection failed: {e:#}"; "sandbox" => &self.id);
+        }
         info!(sl!(), "pause_vm: PUT /vm.pause";
               "sandbox" => &self.id);
         cloud_hypervisor_vm_pause(&self.api_socket)
@@ -917,7 +999,10 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&mut self) -> Result<()> {
+        if let Err(e) = self.reset_api_connection().await {
+            warn!(sl!(), "resume_vm: reset_api_connection failed: {e:#}"; "sandbox" => &self.id);
+        }
         info!(sl!(), "resume_vm: PUT /vm.resume";
               "sandbox" => &self.id);
         cloud_hypervisor_vm_resume(&self.api_socket)
@@ -943,24 +1028,37 @@ impl CloudHypervisorInner {
             )
         })?;
         let url = format!("file://{}", dest_dir.display());
+
+        // Sandbox snapshot/restore: the CLH `api_client` we link against
+        // shares one persistent UnixStream across calls (see
+        // `ch_api::api_command`'s `try_clone()`). With CLH's keep-alive
+        // server, any leftover bytes on the wire from a preceding response
+        // bleed into the next request's parser ("HTTP output is missing
+        // protocol statement"). Reset the socket BEFORE the long
+        // /vm.snapshot call so it starts on a clean stream, AND again
+        // after, so resume_vm gets a fresh connection too.
+        if let Err(e) = self.reset_api_connection().await {
+            warn!(sl!(), "save_vm: pre-snapshot reset_api_connection failed: {e:#}";
+                  "sandbox" => &self.id);
+        }
+
         info!(sl!(), "save_vm: PUT /vm.snapshot";
               "sandbox" => &self.id,
               "destination_url" => &url);
-        cloud_hypervisor_vm_snapshot(&self.api_socket, &url)
-            .await
-            .with_context(|| format!("cloud_hypervisor_vm_snapshot to {url}"))?;
-
-        // CLH closes the keep-alive HTTP connection after a long /vm.snapshot
-        // response (observed on v48 with multi-hundred-MiB guests). Reset our
-        // persistent api_socket here so the post-save resume_vm gets a fresh
-        // connection. Without this, the next API call (typically resume_vm)
-        // fails with a closed-socket error and the workload gets killed by
-        // the supervisor.
-        if let Err(e) = self.reset_api_connection().await {
-            warn!(sl!(), "save_vm: reset_api_connection failed (resume_vm will likely fail too)";
-                  "sandbox" => &self.id,
-                  "error" => format!("{e:#}"));
+        let snap_call_result = cloud_hypervisor_vm_snapshot(&self.api_socket, &url).await;
+        match &snap_call_result {
+            Ok(resp) => info!(sl!(), "save_vm: /vm.snapshot returned"; "sandbox" => &self.id, "response" => format!("{resp:?}")),
+            Err(e) => warn!(sl!(), "save_vm: /vm.snapshot ERR: {e:#}"; "sandbox" => &self.id),
         }
+
+        if let Err(e) = self.reset_api_connection().await {
+            warn!(sl!(), "save_vm: post-snapshot reset_api_connection failed: {e:#}";
+                  "sandbox" => &self.id);
+        } else {
+            info!(sl!(), "save_vm: api socket reset"; "sandbox" => &self.id);
+        }
+
+        snap_call_result.with_context(|| format!("cloud_hypervisor_vm_snapshot to {url}"))?;
         Ok(())
     }
 
@@ -1310,29 +1408,57 @@ async fn cloud_hypervisor_log_output(
                 break;
             },
             stderr_line = poll_fn(|cx| Pin::new(&mut stderr_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stderr_line {
-                    let line = line.ok_or("missing stderr line").map_err(|e| anyhow!(e))?;
-
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stderr"),
+                match stderr_line {
+                    Ok(Some(line)) => {
+                        // Sandbox snapshot/restore: CLH `Fatal error:` lines from
+                        // a failed --restore don't carry the WARN:/ERRO: prefix
+                        // parse_ch_log_level expects; force-classify them so the
+                        // root cause shows up in journald rather than getting
+                        // bucketed as info and lost in noise.
+                        let lvl = if line.contains("Fatal error") || line.contains("ERROR:") {
+                            CloudHypervisorLogLevel::Error
+                        } else {
+                            parse_ch_log_level(&line)
+                        };
+                        match lvl {
+                            CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Error => error!(sl!(), "CH stderr: {}", line),
+                            _ => info!(sl!(), "{:?}", line; "stream" => "stderr"),
+                        }
+                    }
+                    // EOF: CH stderr closed (CH probably exited). Stop logging
+                    // and break the loop so the cleanup at the bottom of the
+                    // function fires (kill + exit_notify).
+                    Ok(None) => {
+                        warn!(sl!(), "CH stderr EOF; child likely exited");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(sl!(), "CH stderr read error: {e}");
+                        break;
                     }
                 }
             },
             stdout_line = poll_fn(|cx| Pin::new(&mut stdout_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stdout_line {
-                    let line = line.ok_or("missing stdout line").map_err(|e| anyhow!(e))?;
-
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stdout"),
+                match stdout_line {
+                    Ok(Some(line)) => {
+                        let lvl = if line.contains("Fatal error") || line.contains("ERROR:") {
+                            CloudHypervisorLogLevel::Error
+                        } else {
+                            parse_ch_log_level(&line)
+                        };
+                        match lvl {
+                            CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Error => error!(sl!(), "CH stdout: {}", line),
+                            _ => info!(sl!(), "{:?}", line; "stream" => "stdout"),
+                        }
                     }
+                    Ok(None) => continue,
+                    Err(_) => continue,
                 }
             },
         };
@@ -1341,7 +1467,9 @@ async fn cloud_hypervisor_log_output(
     // Note that this kills _and_ waits for the process!
     let _ = child.kill().await;
     if let Ok(status) = child.wait().await {
-        let _ = exit_notify.try_send(status.code().unwrap_or(0));
+        let code = status.code().unwrap_or(0);
+        warn!(sl!(), "CH process exited with code {code}");
+        let _ = exit_notify.try_send(code);
     }
 
     Ok(())
