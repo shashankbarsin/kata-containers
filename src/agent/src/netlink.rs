@@ -117,6 +117,16 @@ impl Handle {
             self.enable_link(link.index(), false).await?;
         }
 
+        // Wipe stale globally-scoped addresses so update_interface behaves
+        // as an upsert. Critical for sandbox restore: the snapshot guest's
+        // eth0 carries the pre-snapshot IP, and we want the new pod's CNI
+        // IP to fully replace it (not coexist). Only flush if the request
+        // brings new addresses; otherwise leave the link alone (the caller
+        // may only be touching mtu/name/flags).
+        if !iface.IPAddresses.is_empty() {
+            self.flush_addresses(link.index()).await?;
+        }
+
         // Get whether the network stack has ipv6 enabled or disabled.
         let supports_ipv6_all = fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
             .map(|s| s.trim() == "0")
@@ -608,6 +618,38 @@ impl Handle {
                 .map_err(|err| anyhow!("Failed to add address {}: {:?}", net.ip(), err))?;
         }
 
+        Ok(())
+    }
+
+    /// Remove every globally-scoped (RT_SCOPE_UNIVERSE) IPv4/IPv6 unicast
+    /// address from `index`. Link-local (fe80::/10, scope LINK) and host
+    /// (loopback, scope HOST) addresses are kept because the kernel manages
+    /// them automatically.
+    ///
+    /// Used by `update_interface` to wipe stale addresses before re-adding
+    /// the caller's requested set, so update_interface behaves as an upsert
+    /// instead of an additive merge. For freshly hot-plugged links this is
+    /// a no-op (the link starts with no global addresses).
+    async fn flush_addresses(&mut self, index: u32) -> Result<()> {
+        use netlink_packet_route::address::AddressScope;
+        use netlink_packet_route::AddressFamily as AF;
+        let existing = self.list_addresses(AddressFilter::LinkIndex(index)).await?;
+        for addr in existing {
+            if addr.0.header.scope != AddressScope::Universe {
+                continue;
+            }
+            // Only flush IPv4/IPv6 unicast; skip exotic families.
+            match addr.0.header.family {
+                AF::Inet | AF::Inet6 => {}
+                _ => continue,
+            }
+            self.handle
+                .address()
+                .del(addr.0)
+                .execute()
+                .await
+                .map_err(|err| anyhow!("Failed to flush address from link {}: {:?}", index, err))?;
+        }
         Ok(())
     }
 

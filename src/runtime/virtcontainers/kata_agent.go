@@ -837,8 +837,13 @@ func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 
 	// AKS Pod Snapshot POC: for restore sandboxes the kata-agent inside the
 	// guest already received CreateSandbox before the snapshot was taken,
-	// so we MUST NOT re-issue setupNetworks / CreateSandboxRequest here.
-	// We still verify the grpc server is serving via check().
+	// so we MUST NOT re-issue CreateSandboxRequest here. We DO still call
+	// setupNetworks: the snapshot guest's eth0 carries the pre-snapshot IP
+	// (from the original sandbox's netns), but the restored pod has been
+	// given a new CNI IP. setupNetworks regenerates the Interface/Route
+	// list from the new netns endpoints and the agent's UpdateInterface
+	// flushes the stale address before installing the new one
+	// (see netlink.rs flush_addresses).
 	isRestore := sandbox.config.HypervisorConfig.RestoreFromSnapshot
 
 	// Check grpc server is serving
@@ -847,7 +852,12 @@ func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 	}
 
 	if isRestore {
-		k.Logger().Warn("AKS Pod Snapshot: startSandbox skipping setupNetworks / CreateSandboxRequest in restore mode")
+		k.Logger().Warn("AKS Pod Snapshot: startSandbox in restore mode -- running setupNetworks for IP swap, skipping CreateSandboxRequest")
+		if sandbox.config.HypervisorType != RemoteHypervisor {
+			if err = k.setupNetworks(ctx, sandbox, nil); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -1364,6 +1374,51 @@ func (k *kataAgent) setupNetworks(ctx context.Context, sandbox *Sandbox, c *Cont
 	interfaces, routes, neighs, err := generateVCNetworkStructures(ctx, endpoints)
 	if err != nil {
 		return err
+	}
+
+	// AKS Pod Snapshot: in restore mode the guest's eth0 already exists
+	// inside the kata-VM (from the snapshot) carrying the original
+	// veth/tap MAC. The new pod's CNI veth has a different MAC, which is
+	// what generateVCNetworkStructures emits. The agent's update_interface
+	// looks up the link by MAC, so the new MAC won't find the guest link.
+	// Discover the guest's actual MACs via ListInterfaces and rewrite each
+	// outgoing Interface{}.HwAddr with the guest-side value, keeping the
+	// new IPAddresses/Mtu (which are the substantive change). Pair by
+	// position: the snapshot only ever has one non-loopback interface in
+	// our POC topology and CNI gives the new pod one too. If counts ever
+	// diverge we fall back to the boot-time path and let updateInterface
+	// fail loudly rather than silently misroute.
+	if sandbox.config.HypervisorConfig.RestoreFromSnapshot {
+		guestIfs, lerr := k.listInterfaces(ctx)
+		if lerr != nil {
+			return fmt.Errorf("restore-mode setupNetworks: listInterfaces failed: %w", lerr)
+		}
+		var guestNonLo []*pbTypes.Interface
+		for _, gi := range guestIfs {
+			if gi.Name == "lo" || gi.HwAddr == "" {
+				continue
+			}
+			guestNonLo = append(guestNonLo, gi)
+		}
+		if len(guestNonLo) != len(interfaces) {
+			k.Logger().Warnf("AKS Pod Snapshot: restore-mode setupNetworks: guest has %d non-lo iface(s) but new pod brought %d; skipping MAC remap", len(guestNonLo), len(interfaces))
+		} else {
+			for i, ifc := range interfaces {
+				k.Logger().Warnf("AKS Pod Snapshot: restore-mode IP swap on guest iface name=%q oldMAC=%q -> newIP=%v (MAC stays %q)",
+					guestNonLo[i].Name, guestNonLo[i].HwAddr, ifc.IPAddresses, guestNonLo[i].HwAddr)
+				// Rewrite the lookup key (HwAddr) AND the device-name
+				// fields so the agent finds the existing guest link.
+				ifc.HwAddr = guestNonLo[i].HwAddr
+				ifc.Name = guestNonLo[i].Name
+				ifc.Device = guestNonLo[i].Name
+			}
+			// Routes are keyed by Device too; remap to the guest's iface name.
+			for _, r := range routes {
+				if r.Device != "" {
+					r.Device = guestNonLo[0].Name
+				}
+			}
+		}
 	}
 
 	if err = k.updateInterfaces(ctx, interfaces); err != nil {
