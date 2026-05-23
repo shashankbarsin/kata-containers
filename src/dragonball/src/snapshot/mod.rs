@@ -26,7 +26,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
-use self::metadata::{SnapshotMetadata, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
+use self::metadata::{
+    SnapshotMetadata, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_PAGE_SIZE,
+};
 use self::vcpu_state::VcpuStateData;
 
 /// Configuration passed to [`VmmAction::SnapshotVm`](crate::api::v1::VmmAction).
@@ -78,11 +80,11 @@ pub struct MemoryRegionDescriptor {
 
 /// Write a Phase-1 stub snapshot to `cfg.snapshot_path`.
 ///
-/// File layout (all integers little-endian, see ADR-0003):
+/// File layout (all integers little-endian, v3 — see ADR-0003 + I-008a):
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 2)
+/// [ 8..12] format_version   : u32   (currently 3)
 /// [12..13] vcpu_count       : u8
 /// [13..14] reserved         : u8    (== 0)
 /// [14..16] reserved         : u16   (== 0)
@@ -97,14 +99,21 @@ pub struct MemoryRegionDescriptor {
 /// for each region:
 ///     [u64] guest_phys_addr
 ///     [u64] size
-///     [u64] payload_len             (Phase 1: always == size)
-///     [payload_len bytes] memory contents
+///     [u64] file_offset             (absolute, page-aligned)
+/// <padding to next 4 KiB boundary>
+/// for each region (in declaration order):
+///     <size bytes at file_offset>
+///     <padding to next 4 KiB boundary>
 /// [4 bytes] trailer "END!"
 /// ```
 ///
 /// `region_payload` is invoked once per region (in `regions` order) and is
 /// expected to stream exactly `regions[idx].size` bytes into the writer.
 /// This avoids holding the entire guest RAM in memory at once.
+///
+/// The page-aligned `file_offset` per region lets the restore path
+/// `mmap(MAP_PRIVATE, snap_fd, file_offset, size)` each region directly
+/// over the guest's KVM userspace memory — see `Vm::restore_vm`.
 pub fn write_snapshot(
     cfg: &SnapshotConfig,
     vcpu_states: &[VcpuStateData],
@@ -118,6 +127,36 @@ pub fn write_snapshot(
         vcpu_count: vcpu_states.len() as u8,
         mem_size_bytes: mem_size,
     };
+
+    // Compute the on-disk size of the header (everything before payloads)
+    // up-front so we can stamp absolute page-aligned `file_offset`s into the
+    // region descriptor table without seeking back later.
+    let header_len: u64 = {
+        // Fixed prelude.
+        let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8;
+        // Per-vCPU records.
+        for st in vcpu_states {
+            n += 1; // vcpu_id
+            n += 4 + st.regs.len() as u64;
+            n += 4 + st.sregs.len() as u64;
+            n += 4 + st.msrs.len() as u64;
+            n += 4 + st.cpuid_entries.len() as u64;
+        }
+        // Region descriptor table: u32 count + (u64+u64+u64) per region.
+        n += 4 + (regions.len() as u64) * 24;
+        n
+    };
+    let payloads_start = align_up(header_len, SNAPSHOT_PAGE_SIZE);
+    let header_pad = (payloads_start - header_len) as usize;
+
+    // Pre-compute each region's absolute file_offset; pad each payload tail
+    // to a 4 KiB boundary so subsequent regions also land aligned.
+    let mut region_offsets: Vec<u64> = Vec::with_capacity(regions.len());
+    let mut cursor = payloads_start;
+    for r in regions {
+        region_offsets.push(cursor);
+        cursor = align_up(cursor + r.size, SNAPSHOT_PAGE_SIZE);
+    }
 
     let file = File::create(&cfg.snapshot_path)?;
     let mut w = BufWriter::new(file);
@@ -139,19 +178,50 @@ pub fn write_snapshot(
         write_len_prefixed(&mut w, &state.cpuid_entries)?;
     }
 
-    // Memory region descriptors + payload (I-007).
+    // Memory region descriptor table.
     w.write_all(&(regions.len() as u32).to_le_bytes())?;
-    for (idx, r) in regions.iter().enumerate() {
+    for (r, off) in regions.iter().zip(region_offsets.iter()) {
         w.write_all(&r.guest_phys_addr.to_le_bytes())?;
         w.write_all(&r.size.to_le_bytes())?;
-        w.write_all(&r.size.to_le_bytes())?; // payload_len == size in Phase 1
+        w.write_all(&off.to_le_bytes())?;
+    }
+
+    // Pad header out to the first payload's 4 KiB boundary.
+    write_zero_pad(&mut w, header_pad)?;
+
+    // Region payloads, each padded out to the next 4 KiB boundary so the
+    // following payload (and the trailer in the single-region case) starts
+    // on an aligned offset.
+    for (idx, r) in regions.iter().enumerate() {
         region_payload(idx, &mut w)?;
+        let pad = (align_up(r.size, SNAPSHOT_PAGE_SIZE) - r.size) as usize;
+        write_zero_pad(&mut w, pad)?;
     }
 
     // Trailer.
     w.write_all(&MAGIC_TRAILER)?;
     w.flush()?;
     Ok(metadata)
+}
+
+#[inline]
+fn align_up(value: u64, alignment: u64) -> u64 {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+fn write_zero_pad<W: Write>(w: &mut W, n: usize) -> io::Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    const Z: [u8; 4096] = [0u8; 4096];
+    let mut remaining = n;
+    while remaining > 0 {
+        let take = remaining.min(Z.len());
+        w.write_all(&Z[..take])?;
+        remaining -= take;
+    }
+    Ok(())
 }
 
 fn write_len_prefixed<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {

@@ -22,7 +22,7 @@ use seccompiler::BpfProgram;
 use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
@@ -627,29 +627,82 @@ impl Vm {
             )));
         }
 
-        // Overlay memory pages onto the booted address space.
+        // Overlay memory pages onto the booted address space using
+        // `mmap(MAP_FIXED | MAP_PRIVATE, snap_fd, file_offset, size)` over
+        // the existing anon-mapped guest memory userspace addresses
+        // (I-008a). The KVM_USER_MEMORY_REGION mapping is unchanged; the
+        // host VAs stay identical, so KVM keeps serving the same guest
+        // physical addresses without any further ioctl. MAP_PRIVATE makes
+        // subsequent guest writes COW so the snapshot file is never
+        // mutated.
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let region_count = reader.regions.len();
-        for region_idx in 0..region_count {
-            let descriptor = reader.regions[region_idx];
-            let mut offset: u64 = 0;
-            reader
-                .read_next_region(|chunk| {
-                    let vm_memory = vm_as.memory();
-                    vm_memory
-                        .write_slice(chunk, GuestAddress(descriptor.guest_phys_addr + offset))
-                        .map_err(|e| {
-                            crate::snapshot::SnapshotError::Io(io::Error::other(format!(
-                                "guest write: {e:?}"
-                            )))
-                        })?;
-                    offset += chunk.len() as u64;
-                    Ok(())
-                })
-                .map_err(VmError::Snapshot)?;
+        let snap_fd = reader.raw_fd();
+        let region_locs = reader.regions_for_mmap();
+        for loc in &region_locs {
+            let vm_memory = vm_as.memory();
+            let region = vm_memory
+                .find_region(GuestAddress(loc.guest_phys_addr))
+                .ok_or_else(|| {
+                    VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                        format!(
+                            "no guest memory region covers snapshot gpa 0x{:x}",
+                            loc.guest_phys_addr
+                        ),
+                    )))
+                })?;
+            let region_offset = loc.guest_phys_addr - region.start_addr().raw_value();
+            if region_offset + loc.size > region.len() {
+                return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                    io::Error::other(format!(
+                        "snapshot region (gpa 0x{:x} size 0x{:x}) overflows guest region (start 0x{:x} len 0x{:x})",
+                        loc.guest_phys_addr,
+                        loc.size,
+                        region.start_addr().raw_value(),
+                        region.len()
+                    )),
+                )));
+            }
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(region_offset))
+                .map_err(|e| {
+                    VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                        format!("get_host_address failed: {e:?}"),
+                    )))
+                })?;
+            if (host_addr as usize) % 4096 != 0 {
+                return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                    io::Error::other(format!(
+                        "host_addr {host_addr:p} not page-aligned; cannot MAP_FIXED"
+                    )),
+                )));
+            }
+            // SAFETY: `host_addr..host_addr+size` is currently an anon
+            // MAP_PRIVATE mapping owned by the guest memory address space.
+            // MAP_FIXED replaces it atomically with a file-backed
+            // MAP_PRIVATE mapping of equal length at the same VA. The old
+            // mapping is automatically unmapped by the kernel.
+            let ret = unsafe {
+                libc::mmap(
+                    host_addr as *mut libc::c_void,
+                    loc.size as libc::size_t,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE,
+                    snap_fd,
+                    loc.file_offset as libc::off_t,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                let err = io::Error::last_os_error();
+                return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                    io::Error::other(format!(
+                        "mmap MAP_FIXED|MAP_PRIVATE failed at host_addr {host_addr:p} size 0x{:x} file_offset 0x{:x}: {err}",
+                        loc.size, loc.file_offset
+                    )),
+                )));
+            }
         }
         reader.check_trailer().map_err(VmError::Snapshot)?;
 

@@ -1,25 +1,54 @@
 // Copyright (C) 2025 Microsoft Corporation. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Snapshot blob reader (planning-repo ADR-0003, I-007).
+//! Snapshot blob reader (planning-repo ADR-0003, I-007 / I-008a).
 //!
-//! Phase 1 reader: parses the ATEOMSN1 v2 format into in-memory structs.
-//! Memory payloads are streamed via a callback so the caller can write them
-//! straight into guest memory without materializing all 256 MiB at once.
+//! v3 reader: parses the ATEOMSN1 v3 format. Header carries an absolute
+//! page-aligned `file_offset` per memory region so the caller can either
+//! stream the payload via [`SnapshotReader::read_next_region`] (Phase-1
+//! restore) **or** `mmap(MAP_PRIVATE, snap_fd, file_offset, size)` it
+//! directly over guest memory (I-008a mmap overlay).
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
-use std::path::Path;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 
 use super::metadata::{MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
 use super::vcpu_state::VcpuStateData;
 use super::{MemoryRegionDescriptor, SnapshotError};
 
+/// Descriptor enriched with the absolute file offset where the region's
+/// payload lives. Used by the mmap restore fast path.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionLocation {
+    /// Guest physical address of the region.
+    pub guest_phys_addr: u64,
+    /// Region size in bytes.
+    pub size: u64,
+    /// Absolute, page-aligned byte offset of the region payload inside
+    /// the snapshot file.
+    pub file_offset: u64,
+}
+
+impl From<RegionLocation> for MemoryRegionDescriptor {
+    fn from(loc: RegionLocation) -> Self {
+        MemoryRegionDescriptor {
+            guest_phys_addr: loc.guest_phys_addr,
+            size: loc.size,
+        }
+    }
+}
+
 /// Parsed header + vCPU state. Memory payloads are NOT loaded eagerly; the
-/// caller drives them via [`SnapshotReader::for_each_region`].
+/// caller drives them either via [`SnapshotReader::read_next_region`]
+/// (streamed copy) or [`SnapshotReader::regions_for_mmap`] +
+/// [`SnapshotReader::raw_fd`] (mmap-overlay fast path).
 #[derive(Debug)]
 pub struct SnapshotReader {
     reader: BufReader<File>,
+    /// Path the snapshot was opened from (informational).
+    pub path: PathBuf,
     /// `format_version` from the header.
     pub format_version: u32,
     /// Number of vCPU states recorded in this snapshot.
@@ -28,16 +57,17 @@ pub struct SnapshotReader {
     pub mem_size_bytes: u64,
     /// Captured vCPU register snapshots (already consumed from the stream).
     pub vcpu_states: Vec<VcpuStateData>,
-    /// Memory region descriptor table.
+    /// Memory region descriptor table — guest addr + size only.
     pub regions: Vec<MemoryRegionDescriptor>,
-    /// Cursor position after the region descriptor table; the body of
-    /// `for_each_region` starts here.
+    /// Per-region absolute file offsets (parallel to `regions`).
+    pub region_offsets: Vec<u64>,
+    /// Index of next region to stream via [`Self::read_next_region`].
     region_index: usize,
 }
 
 impl SnapshotReader {
     /// Open and parse the snapshot at `path`, leaving the reader positioned
-    /// just before the first region's payload bytes.
+    /// at the start of the first region payload's page-aligned slot.
     pub fn open(path: &Path) -> Result<Self, SnapshotError> {
         let file = File::open(path)?;
         let mut r = BufReader::new(file);
@@ -83,40 +113,24 @@ impl SnapshotReader {
 
         let region_count = read_u32(&mut r)?;
         let mut regions = Vec::with_capacity(region_count as usize);
-        // We need to read descriptors but NOT payload yet — payload follows
-        // each descriptor inline per format v2. So loop region-at-a-time and
-        // remember to drive `for_each_region` immediately after.
-        // Simpler: parse all descriptors-and-skip-payload here would require
-        // seeking. Instead expose `for_each_region` that does the
-        // interleaved read in order.
-        //
-        // To allow callers to inspect descriptors first, we read the first
-        // descriptor here and stash the rest behind a state-machine cursor.
-        // BUT — for Phase 1 the descriptor table is always 1 entry, so we
-        // read it eagerly and let `for_each_region` consume the payload.
+        let mut region_offsets = Vec::with_capacity(region_count as usize);
         for _ in 0..region_count {
             let guest_phys_addr = read_u64(&mut r)?;
             let size = read_u64(&mut r)?;
-            let payload_len = read_u64(&mut r)?;
-            if payload_len != size {
+            let file_offset = read_u64(&mut r)?;
+            if file_offset % 4096 != 0 {
                 return Err(SnapshotError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "Phase 1 expects payload_len == size; got {payload_len} vs {size}"
-                    ),
+                    format!("region file_offset {file_offset} is not 4 KiB aligned"),
                 )));
             }
             regions.push(MemoryRegionDescriptor {
                 guest_phys_addr,
                 size,
             });
-            // NOTE: cannot eagerly skip payload here because the caller
-            // wants to consume it next. Bail out of the descriptor loop
-            // after the first; restart of descriptors-after-payload-N
-            // would require seeking. Phase 1 has exactly one region so
-            // this simplification is fine — assert.
-            break;
+            region_offsets.push(file_offset);
         }
+        // Phase 1 / I-008a still expects exactly one region; I-008b widens.
         if region_count != 1 {
             return Err(SnapshotError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -124,21 +138,48 @@ impl SnapshotReader {
             )));
         }
 
+        // Seek to the first region's payload — the stream is currently at
+        // the end of the descriptor table; the payload lives at the
+        // page-aligned offset stamped into the descriptor.
+        r.seek(SeekFrom::Start(region_offsets[0]))?;
+
         Ok(SnapshotReader {
             reader: r,
+            path: path.to_path_buf(),
             format_version,
             vcpu_count,
             mem_size_bytes,
             vcpu_states,
             regions,
+            region_offsets,
             region_index: 0,
         })
     }
 
-    /// Stream the next region's memory payload into `sink`.
-    ///
-    /// Returns the descriptor of the region just streamed. Callers should
-    /// loop while `region_index < regions.len()`.
+    /// Raw file descriptor of the underlying snapshot file. Borrowed; the
+    /// `SnapshotReader` retains ownership for the lifetime of the returned
+    /// fd. Intended for `mmap` calls that need to map the file directly.
+    pub fn raw_fd(&self) -> RawFd {
+        self.reader.get_ref().as_raw_fd()
+    }
+
+    /// Per-region `(guest_phys_addr, size, file_offset)` triples for the
+    /// mmap fast path. Parallel to [`Self::regions`].
+    pub fn regions_for_mmap(&self) -> Vec<RegionLocation> {
+        self.regions
+            .iter()
+            .zip(self.region_offsets.iter())
+            .map(|(r, off)| RegionLocation {
+                guest_phys_addr: r.guest_phys_addr,
+                size: r.size,
+                file_offset: *off,
+            })
+            .collect()
+    }
+
+    /// Stream the next region's memory payload into `sink` (Phase-1
+    /// memcpy restore path). Returns the descriptor of the region just
+    /// streamed.
     pub fn read_next_region<S>(
         &mut self,
         mut sink: S,
@@ -152,6 +193,10 @@ impl SnapshotReader {
                 "no more regions to read",
             )));
         }
+        // Seek to this region's page-aligned payload offset. (Open() left
+        // us at region 0; second and later calls need an explicit seek.)
+        let offset = self.region_offsets[self.region_index];
+        self.reader.seek(SeekFrom::Start(offset))?;
         let desc = self.regions[self.region_index];
         let mut remaining = desc.size as usize;
         let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunks.
@@ -165,8 +210,18 @@ impl SnapshotReader {
         Ok(desc)
     }
 
-    /// Verify the trailer is present at the current stream position.
+    /// Verify the trailer is present at end of file.
     pub fn check_trailer(&mut self) -> Result<(), SnapshotError> {
+        // Trailer is the last 4 bytes of the file regardless of how many
+        // regions there were.
+        let len = self.reader.get_ref().metadata()?.len();
+        if len < 4 {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot too short for trailer",
+            )));
+        }
+        self.reader.seek(SeekFrom::Start(len - 4))?;
         let mut trailer = [0u8; 4];
         self.reader.read_exact(&mut trailer)?;
         if trailer != MAGIC_TRAILER {

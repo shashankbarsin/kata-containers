@@ -17,7 +17,15 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// values. Each version must be readable by all subsequent versions.
 /// Bumped to 2 in I-007 when per-region memory payload was added after the
 /// region descriptor table; restore reads payload bytes for each region.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Bumped to 3 in I-008a: region descriptors carry an absolute, page-aligned
+/// `file_offset` and the descriptor table is padded to a 4 KiB boundary so
+/// that each region payload starts on a page boundary — enabling
+/// `mmap(MAP_PRIVATE)` of the snapshot file directly as guest memory.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+
+/// Page size assumed by the v3 alignment scheme. Matches every architecture
+/// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.
+pub const SNAPSHOT_PAGE_SIZE: u64 = 4096;
 
 /// Decoded snapshot header / summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
