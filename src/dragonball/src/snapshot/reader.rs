@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use super::metadata::{MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
 use super::vcpu_state::VcpuStateData;
+use super::vm_state::VmStateData;
 use super::{MemoryRegionDescriptor, SnapshotError};
 
 /// Descriptor enriched with the absolute file offset where the region's
@@ -57,6 +58,8 @@ pub struct SnapshotReader {
     pub mem_size_bytes: u64,
     /// Captured vCPU register snapshots (already consumed from the stream).
     pub vcpu_states: Vec<VcpuStateData>,
+    /// Captured VM-level architectural state (v4+).
+    pub vm_state: VmStateData,
     /// Memory region descriptor table — guest addr + size only.
     pub regions: Vec<MemoryRegionDescriptor>,
     /// Per-region absolute file offsets (parallel to `regions`).
@@ -102,12 +105,20 @@ impl SnapshotReader {
             let sregs = read_len_prefixed(&mut r)?;
             let msrs = read_len_prefixed(&mut r)?;
             let cpuid_entries = read_len_prefixed(&mut r)?;
+            let lapic = read_len_prefixed(&mut r)?;
+            let xsave = read_len_prefixed(&mut r)?;
+            let vcpu_events = read_len_prefixed(&mut r)?;
+            let mp_state = read_len_prefixed(&mut r)?;
             vcpu_states.push(VcpuStateData {
                 vcpu_id,
                 regs,
                 sregs,
                 msrs,
                 cpuid_entries,
+                lapic,
+                xsave,
+                vcpu_events,
+                mp_state,
             });
         }
 
@@ -138,6 +149,20 @@ impl SnapshotReader {
             )));
         }
 
+        // VM-level state block (v4).
+        let pic_master = read_len_prefixed(&mut r)?;
+        let pic_slave = read_len_prefixed(&mut r)?;
+        let ioapic = read_len_prefixed(&mut r)?;
+        let pit2 = read_len_prefixed(&mut r)?;
+        let clock = read_len_prefixed(&mut r)?;
+        let vm_state = VmStateData {
+            pic_master,
+            pic_slave,
+            ioapic,
+            pit2,
+            clock,
+        };
+
         // Seek to the first region's payload — the stream is currently at
         // the end of the descriptor table; the payload lives at the
         // page-aligned offset stamped into the descriptor.
@@ -150,6 +175,7 @@ impl SnapshotReader {
             vcpu_count,
             mem_size_bytes,
             vcpu_states,
+            vm_state,
             regions,
             region_offsets,
             region_index: 0,

@@ -14,13 +14,16 @@
 //! payload (planning-repo ADR-0003).
 
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{kvm_cpuid_entry2, kvm_msr_entry, kvm_regs, kvm_sregs, CpuId, Msrs};
+use kvm_bindings::{
+    kvm_cpuid_entry2, kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_regs, kvm_sregs,
+    kvm_vcpu_events, kvm_xsave, CpuId, Msrs,
+};
 #[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuFd;
 
 /// Raw register state captured from a paused vCPU.
 ///
-/// The four register-set fields are wire-format raw bytes — the kernel
+/// The register-set fields are wire-format raw bytes — the kernel
 /// `kvm_*` C structs are `#[repr(C)]` so a direct `as_bytes`/`from_bytes`
 /// round-trip on the same machine is safe.
 #[derive(Debug, Default, Clone)]
@@ -35,6 +38,14 @@ pub struct VcpuStateData {
     pub msrs: Vec<u8>,
     /// Concatenated raw `kvm_cpuid_entry2` bytes.
     pub cpuid_entries: Vec<u8>,
+    /// Raw `kvm_lapic_state` bytes (in-kernel LAPIC). Empty on older snaps.
+    pub lapic: Vec<u8>,
+    /// Raw `kvm_xsave` bytes (FPU+SSE+AVX+...).
+    pub xsave: Vec<u8>,
+    /// Raw `kvm_vcpu_events` bytes (pending exceptions, NMI, SIPI, ...).
+    pub vcpu_events: Vec<u8>,
+    /// Raw `kvm_mp_state` bytes (vCPU run state machine).
+    pub mp_state: Vec<u8>,
 }
 
 /// Errors raised while capturing per-vCPU state.
@@ -78,12 +89,24 @@ pub fn capture(
     let read = fd.get_msrs(&mut msrs)?;
     let msr_entries = &msrs.as_slice()[..read];
 
+    // Additional architectural state needed for a no-boot restore
+    // (I-008b). Captured here so the snapshot is self-sufficient and
+    // round-trips with no help from a freshly-booted carrier VM.
+    let lapic: kvm_lapic_state = fd.get_lapic()?;
+    let xsave: kvm_xsave = fd.get_xsave()?;
+    let vcpu_events: kvm_vcpu_events = fd.get_vcpu_events()?;
+    let mp_state: kvm_mp_state = fd.get_mp_state()?;
+
     Ok(VcpuStateData {
         vcpu_id,
         regs: struct_to_bytes(&regs),
         sregs: struct_to_bytes(&sregs),
         msrs: slice_to_bytes(msr_entries),
         cpuid_entries: slice_to_bytes(cpuid_entries),
+        lapic: struct_to_bytes(&lapic),
+        xsave: struct_to_bytes(&xsave),
+        vcpu_events: struct_to_bytes(&vcpu_events),
+        mp_state: struct_to_bytes(&mp_state),
     })
 }
 
@@ -125,9 +148,9 @@ fn slice_to_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 /// Apply a previously captured `VcpuStateData` to a paused vCPU.
 ///
-/// Inverse of [`capture`]. Calls `KVM_SET_REGS`, `KVM_SET_SREGS`,
-/// `KVM_SET_MSRS`, `KVM_SET_CPUID2`. Used by the I-007 restore path
-/// (planning-repo ADR-0003).
+/// Inverse of [`capture`]. The set order mirrors cloud-hypervisor's working
+/// `KvmVcpu::set_state` sequence so that pending exceptions / LAPIC vectors
+/// don't get clobbered between calls.
 pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
     use std::mem::size_of;
 
@@ -152,28 +175,21 @@ pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
         fd.set_cpuid2(&cpuid)?;
     }
 
-    // 2. SREGS, then REGS.
-    if state.sregs.len() != size_of::<kvm_sregs>() {
-        return Err(VcpuStateError::BuildMsrs(format!(
-            "sregs blob length {} != sizeof(kvm_sregs) {}",
-            state.sregs.len(),
-            size_of::<kvm_sregs>()
-        )));
+    // 2. MP_STATE (must come before LAPIC per KVM API doc).
+    if state.mp_state.len() == size_of::<kvm_mp_state>() {
+        let mp: kvm_mp_state =
+            unsafe { std::ptr::read(state.mp_state.as_ptr() as *const kvm_mp_state) };
+        fd.set_mp_state(mp)?;
     }
-    let sregs: kvm_sregs = unsafe { std::ptr::read(state.sregs.as_ptr() as *const kvm_sregs) };
-    fd.set_sregs(&sregs)?;
 
-    if state.regs.len() != size_of::<kvm_regs>() {
-        return Err(VcpuStateError::BuildMsrs(format!(
-            "regs blob length {} != sizeof(kvm_regs) {}",
-            state.regs.len(),
-            size_of::<kvm_regs>()
-        )));
+    // 3. LAPIC.
+    if state.lapic.len() == size_of::<kvm_lapic_state>() {
+        let lapic: kvm_lapic_state =
+            unsafe { std::ptr::read(state.lapic.as_ptr() as *const kvm_lapic_state) };
+        fd.set_lapic(&lapic)?;
     }
-    let regs: kvm_regs = unsafe { std::ptr::read(state.regs.as_ptr() as *const kvm_regs) };
-    fd.set_regs(&regs)?;
 
-    // 3. MSRs.
+    // 4. MSRs.
     if !state.msrs.is_empty() {
         let entry_size = size_of::<kvm_msr_entry>();
         if state.msrs.len() % entry_size != 0 {
@@ -190,6 +206,43 @@ pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
         let msrs = Msrs::from_entries(&entries)
             .map_err(|e| VcpuStateError::BuildMsrs(format!("{e:?}")))?;
         let _written = fd.set_msrs(&msrs)?;
+    }
+
+    // 5. REGS, then SREGS.
+    if state.regs.len() != size_of::<kvm_regs>() {
+        return Err(VcpuStateError::BuildMsrs(format!(
+            "regs blob length {} != sizeof(kvm_regs) {}",
+            state.regs.len(),
+            size_of::<kvm_regs>()
+        )));
+    }
+    let regs: kvm_regs = unsafe { std::ptr::read(state.regs.as_ptr() as *const kvm_regs) };
+    fd.set_regs(&regs)?;
+
+    if state.sregs.len() != size_of::<kvm_sregs>() {
+        return Err(VcpuStateError::BuildMsrs(format!(
+            "sregs blob length {} != sizeof(kvm_sregs) {}",
+            state.sregs.len(),
+            size_of::<kvm_sregs>()
+        )));
+    }
+    let sregs: kvm_sregs = unsafe { std::ptr::read(state.sregs.as_ptr() as *const kvm_sregs) };
+    fd.set_sregs(&sregs)?;
+
+    // 6. XSAVE.
+    if state.xsave.len() == size_of::<kvm_xsave>() {
+        let xsave: kvm_xsave =
+            unsafe { std::ptr::read(state.xsave.as_ptr() as *const kvm_xsave) };
+        fd.set_xsave(&xsave)?;
+    }
+
+    // 7. VCPU_EVENTS (pending exceptions/NMI; do last so they aren't
+    //    overwritten by SET_LAPIC's spurious-vector clearing).
+    if state.vcpu_events.len() == size_of::<kvm_vcpu_events>() {
+        let ev: kvm_vcpu_events = unsafe {
+            std::ptr::read(state.vcpu_events.as_ptr() as *const kvm_vcpu_events)
+        };
+        fd.set_vcpu_events(&ev)?;
     }
 
     Ok(())

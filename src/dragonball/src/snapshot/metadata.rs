@@ -21,7 +21,12 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// `file_offset` and the descriptor table is padded to a 4 KiB boundary so
 /// that each region payload starts on a page boundary — enabling
 /// `mmap(MAP_PRIVATE)` of the snapshot file directly as guest memory.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+/// Bumped to 4 in I-008b: per-vCPU records gain `lapic` / `xsave` /
+/// `vcpu_events` / `mp_state` blobs and a new VM-level state block
+/// (PIC master/slave, IOAPIC, PIT2, KVM_CLOCK) is written between the
+/// region descriptor table and the header padding. This is the minimum
+/// state needed for a no-boot mmap restore.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// Page size assumed by the v3 alignment scheme. Matches every architecture
 /// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.

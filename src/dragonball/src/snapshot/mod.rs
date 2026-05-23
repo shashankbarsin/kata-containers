@@ -21,6 +21,7 @@ pub mod kvm_dirty_tracker;
 pub mod metadata;
 pub mod reader;
 pub mod vcpu_state;
+pub mod vm_state;
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -30,6 +31,7 @@ use self::metadata::{
     SnapshotMetadata, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_PAGE_SIZE,
 };
 use self::vcpu_state::VcpuStateData;
+use self::vm_state::VmStateData;
 
 /// Configuration passed to [`VmmAction::SnapshotVm`](crate::api::v1::VmmAction).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,13 +80,13 @@ pub struct MemoryRegionDescriptor {
     pub size: u64,
 }
 
-/// Write a Phase-1 stub snapshot to `cfg.snapshot_path`.
+/// Write a snapshot blob to `cfg.snapshot_path`.
 ///
-/// File layout (all integers little-endian, v3 — see ADR-0003 + I-008a):
+/// File layout (all integers little-endian, v4 — I-008b extends v3):
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 3)
+/// [ 8..12] format_version   : u32   (currently 4)
 /// [12..13] vcpu_count       : u8
 /// [13..14] reserved         : u8    (== 0)
 /// [14..16] reserved         : u16   (== 0)
@@ -95,28 +97,31 @@ pub struct MemoryRegionDescriptor {
 ///     [u32 len + bytes]  kvm_sregs raw
 ///     [u32 len + bytes]  kvm_msr_entry[] raw
 ///     [u32 len + bytes]  kvm_cpuid_entry2[] raw
+///     [u32 len + bytes]  kvm_lapic_state raw       (v4)
+///     [u32 len + bytes]  kvm_xsave raw             (v4)
+///     [u32 len + bytes]  kvm_vcpu_events raw       (v4)
+///     [u32 len + bytes]  kvm_mp_state raw          (v4)
 /// [u32] memory_region_count
 /// for each region:
 ///     [u64] guest_phys_addr
 ///     [u64] size
 ///     [u64] file_offset             (absolute, page-aligned)
+/// VM-level state (v4):
+///     [u32 len + bytes]  kvm_irqchip (PIC master)
+///     [u32 len + bytes]  kvm_irqchip (PIC slave)
+///     [u32 len + bytes]  kvm_irqchip (IOAPIC)
+///     [u32 len + bytes]  kvm_pit_state2
+///     [u32 len + bytes]  kvm_clock_data
 /// <padding to next 4 KiB boundary>
 /// for each region (in declaration order):
 ///     <size bytes at file_offset>
 ///     <padding to next 4 KiB boundary>
 /// [4 bytes] trailer "END!"
 /// ```
-///
-/// `region_payload` is invoked once per region (in `regions` order) and is
-/// expected to stream exactly `regions[idx].size` bytes into the writer.
-/// This avoids holding the entire guest RAM in memory at once.
-///
-/// The page-aligned `file_offset` per region lets the restore path
-/// `mmap(MAP_PRIVATE, snap_fd, file_offset, size)` each region directly
-/// over the guest's KVM userspace memory — see `Vm::restore_vm`.
 pub fn write_snapshot(
     cfg: &SnapshotConfig,
     vcpu_states: &[VcpuStateData],
+    vm_state: &VmStateData,
     regions: &[MemoryRegionDescriptor],
     mut region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
@@ -134,16 +139,26 @@ pub fn write_snapshot(
     let header_len: u64 = {
         // Fixed prelude.
         let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8;
-        // Per-vCPU records.
+        // Per-vCPU records (8 len-prefixed blobs in v4).
         for st in vcpu_states {
             n += 1; // vcpu_id
             n += 4 + st.regs.len() as u64;
             n += 4 + st.sregs.len() as u64;
             n += 4 + st.msrs.len() as u64;
             n += 4 + st.cpuid_entries.len() as u64;
+            n += 4 + st.lapic.len() as u64;
+            n += 4 + st.xsave.len() as u64;
+            n += 4 + st.vcpu_events.len() as u64;
+            n += 4 + st.mp_state.len() as u64;
         }
         // Region descriptor table: u32 count + (u64+u64+u64) per region.
         n += 4 + (regions.len() as u64) * 24;
+        // VM-level state: 5 len-prefixed blobs.
+        n += 4 + vm_state.pic_master.len() as u64;
+        n += 4 + vm_state.pic_slave.len() as u64;
+        n += 4 + vm_state.ioapic.len() as u64;
+        n += 4 + vm_state.pit2.len() as u64;
+        n += 4 + vm_state.clock.len() as u64;
         n
     };
     let payloads_start = align_up(header_len, SNAPSHOT_PAGE_SIZE);
@@ -169,13 +184,17 @@ pub fn write_snapshot(
     w.write_all(&0u16.to_le_bytes())?; // reserved
     w.write_all(&metadata.mem_size_bytes.to_le_bytes())?;
 
-    // Per-vCPU state.
+    // Per-vCPU state (8 len-prefixed blobs in v4).
     for state in vcpu_states {
         w.write_all(&[state.vcpu_id])?;
         write_len_prefixed(&mut w, &state.regs)?;
         write_len_prefixed(&mut w, &state.sregs)?;
         write_len_prefixed(&mut w, &state.msrs)?;
         write_len_prefixed(&mut w, &state.cpuid_entries)?;
+        write_len_prefixed(&mut w, &state.lapic)?;
+        write_len_prefixed(&mut w, &state.xsave)?;
+        write_len_prefixed(&mut w, &state.vcpu_events)?;
+        write_len_prefixed(&mut w, &state.mp_state)?;
     }
 
     // Memory region descriptor table.
@@ -185,6 +204,13 @@ pub fn write_snapshot(
         w.write_all(&r.size.to_le_bytes())?;
         w.write_all(&off.to_le_bytes())?;
     }
+
+    // VM-level state block (v4).
+    write_len_prefixed(&mut w, &vm_state.pic_master)?;
+    write_len_prefixed(&mut w, &vm_state.pic_slave)?;
+    write_len_prefixed(&mut w, &vm_state.ioapic)?;
+    write_len_prefixed(&mut w, &vm_state.pit2)?;
+    write_len_prefixed(&mut w, &vm_state.clock)?;
 
     // Pad header out to the first payload's 4 KiB boundary.
     write_zero_pad(&mut w, header_pad)?;

@@ -555,12 +555,19 @@ impl Vm {
             size: mem_size_bytes,
         }];
 
+        // 3b. VM-level architectural state (irqchip, PIT2, clock).
+        let vm_state = crate::snapshot::vm_state::capture(self.vm_fd()).map_err(|e| {
+            VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("vm-state capture: {e}"),
+            )))
+        })?;
+
         // 4. write blob, streaming guest memory page-chunks straight to disk.
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &regions, |idx, w| {
+        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &regions, |idx, w| {
             let r = regions[idx];
             let vm_memory = vm_as.memory();
             // Read in 1 MiB chunks so we don't materialize all of guest RAM
@@ -705,6 +712,16 @@ impl Vm {
             }
         }
         reader.check_trailer().map_err(VmError::Snapshot)?;
+
+        // Apply VM-level KVM state (irqchip, PIT2, clock) BEFORE per-vCPU
+        // state so that SET_LAPIC's interrupt routing lands on top of a
+        // fully-configured in-kernel irqchip. v4+; older snapshots have
+        // empty fields and the apply is a no-op.
+        crate::snapshot::vm_state::apply(self.vm_fd(), &reader.vm_state).map_err(|e| {
+            VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("vm-state apply: {e}"),
+            )))
+        })?;
 
         // Inject vCPU register state into the (paused) vCPU threads.
         let vcpu_states = std::mem::take(&mut reader.vcpu_states);
