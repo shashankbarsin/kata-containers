@@ -15,7 +15,9 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 
 /// Current snapshot format version. Bump on any layout change; never reuse
 /// values. Each version must be readable by all subsequent versions.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 in I-007 when per-region memory payload was added after the
+/// region descriptor table; restore reads payload bytes for each region.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Decoded snapshot header / summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

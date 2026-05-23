@@ -14,7 +14,7 @@
 //! payload (planning-repo ADR-0003).
 
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{kvm_cpuid_entry2, kvm_msr_entry, kvm_regs, kvm_sregs, Msrs};
+use kvm_bindings::{kvm_cpuid_entry2, kvm_msr_entry, kvm_regs, kvm_sregs, CpuId, Msrs};
 #[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuFd;
 
@@ -120,4 +120,84 @@ fn slice_to_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
     let slice =
         unsafe { std::slice::from_raw_parts(items.as_ptr() as *const u8, byte_len) };
     slice.to_vec()
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Apply a previously captured `VcpuStateData` to a paused vCPU.
+///
+/// Inverse of [`capture`]. Calls `KVM_SET_REGS`, `KVM_SET_SREGS`,
+/// `KVM_SET_MSRS`, `KVM_SET_CPUID2`. Used by the I-007 restore path
+/// (planning-repo ADR-0003).
+pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
+    use std::mem::size_of;
+
+    // 1. CPUID — must come before SET_SREGS per KVM API conventions.
+    if !state.cpuid_entries.is_empty() {
+        let entry_size = size_of::<kvm_cpuid_entry2>();
+        if state.cpuid_entries.len() % entry_size != 0 {
+            return Err(VcpuStateError::BuildMsrs(format!(
+                "cpuid blob length {} not a multiple of entry size {entry_size}",
+                state.cpuid_entries.len()
+            )));
+        }
+        let count = state.cpuid_entries.len() / entry_size;
+        let entries: &[kvm_cpuid_entry2] = unsafe {
+            std::slice::from_raw_parts(
+                state.cpuid_entries.as_ptr() as *const kvm_cpuid_entry2,
+                count,
+            )
+        };
+        let cpuid =
+            CpuId::from_entries(entries).map_err(|e| VcpuStateError::BuildMsrs(format!("{e:?}")))?;
+        fd.set_cpuid2(&cpuid)?;
+    }
+
+    // 2. SREGS, then REGS.
+    if state.sregs.len() != size_of::<kvm_sregs>() {
+        return Err(VcpuStateError::BuildMsrs(format!(
+            "sregs blob length {} != sizeof(kvm_sregs) {}",
+            state.sregs.len(),
+            size_of::<kvm_sregs>()
+        )));
+    }
+    let sregs: kvm_sregs = unsafe { std::ptr::read(state.sregs.as_ptr() as *const kvm_sregs) };
+    fd.set_sregs(&sregs)?;
+
+    if state.regs.len() != size_of::<kvm_regs>() {
+        return Err(VcpuStateError::BuildMsrs(format!(
+            "regs blob length {} != sizeof(kvm_regs) {}",
+            state.regs.len(),
+            size_of::<kvm_regs>()
+        )));
+    }
+    let regs: kvm_regs = unsafe { std::ptr::read(state.regs.as_ptr() as *const kvm_regs) };
+    fd.set_regs(&regs)?;
+
+    // 3. MSRs.
+    if !state.msrs.is_empty() {
+        let entry_size = size_of::<kvm_msr_entry>();
+        if state.msrs.len() % entry_size != 0 {
+            return Err(VcpuStateError::BuildMsrs(format!(
+                "msrs blob length {} not a multiple of entry size {entry_size}",
+                state.msrs.len()
+            )));
+        }
+        let count = state.msrs.len() / entry_size;
+        let entries: Vec<kvm_msr_entry> = unsafe {
+            std::slice::from_raw_parts(state.msrs.as_ptr() as *const kvm_msr_entry, count)
+        }
+        .to_vec();
+        let msrs = Msrs::from_entries(&entries)
+            .map_err(|e| VcpuStateError::BuildMsrs(format!("{e:?}")))?;
+        let _written = fd.set_msrs(&msrs)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(unused_variables)]
+/// Placeholder for non-x86_64.
+pub fn apply(_fd: &(), _state: &VcpuStateData) -> Result<(), VcpuStateError> {
+    Ok(())
 }

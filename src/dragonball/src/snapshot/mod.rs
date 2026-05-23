@@ -19,6 +19,7 @@
 
 pub mod kvm_dirty_tracker;
 pub mod metadata;
+pub mod reader;
 pub mod vcpu_state;
 
 use std::fs::File;
@@ -32,6 +33,18 @@ use self::vcpu_state::VcpuStateData;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotConfig {
     /// Filesystem path where the snapshot blob should be written.
+    pub snapshot_path: PathBuf,
+}
+
+/// Configuration passed to [`VmmAction::RestoreVm`](crate::api::v1::VmmAction).
+///
+/// Phase 1 (I-007): the snapshot file produced by an earlier
+/// `SnapshotVm` is overlaid on top of an already-booted, already-paused
+/// microVM. The substrate-side trait orchestrates boot+pause+restore as a
+/// single `Vmm::restore` call; this struct only carries the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreConfig {
+    /// Filesystem path of the snapshot blob to load.
     pub snapshot_path: PathBuf,
 }
 
@@ -69,7 +82,7 @@ pub struct MemoryRegionDescriptor {
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 1)
+/// [ 8..12] format_version   : u32   (currently 2)
 /// [12..13] vcpu_count       : u8
 /// [13..14] reserved         : u8    (== 0)
 /// [14..16] reserved         : u16   (== 0)
@@ -84,12 +97,19 @@ pub struct MemoryRegionDescriptor {
 /// for each region:
 ///     [u64] guest_phys_addr
 ///     [u64] size
+///     [u64] payload_len             (Phase 1: always == size)
+///     [payload_len bytes] memory contents
 /// [4 bytes] trailer "END!"
 /// ```
+///
+/// `region_payload` is invoked once per region (in `regions` order) and is
+/// expected to stream exactly `regions[idx].size` bytes into the writer.
+/// This avoids holding the entire guest RAM in memory at once.
 pub fn write_snapshot(
     cfg: &SnapshotConfig,
     vcpu_states: &[VcpuStateData],
     regions: &[MemoryRegionDescriptor],
+    mut region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
     let mem_size: u64 = regions.iter().map(|r| r.size).sum();
     let metadata = SnapshotMetadata {
@@ -119,11 +139,13 @@ pub fn write_snapshot(
         write_len_prefixed(&mut w, &state.cpuid_entries)?;
     }
 
-    // Memory region descriptors.
+    // Memory region descriptors + payload (I-007).
     w.write_all(&(regions.len() as u32).to_le_bytes())?;
-    for r in regions {
+    for (idx, r) in regions.iter().enumerate() {
         w.write_all(&r.guest_phys_addr.to_le_bytes())?;
         w.write_all(&r.size.to_le_bytes())?;
+        w.write_all(&r.size.to_le_bytes())?; // payload_len == size in Phase 1
+        region_payload(idx, &mut w)?;
     }
 
     // Trailer.

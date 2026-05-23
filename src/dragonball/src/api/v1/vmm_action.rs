@@ -207,6 +207,12 @@ pub enum VmmAction {
     /// vCPUs must already be paused (call [`VmmAction::PauseMicroVm`] first).
     SnapshotVm(crate::snapshot::SnapshotConfig),
 
+    /// POC (agent-substrate planning-repo I-007): overlay a snapshot blob
+    /// on top of an already-booted, already-paused microVM. After this
+    /// returns, the caller must send `ResumeMicroVm` to bring the guest up
+    /// with the injected register/memory state.
+    RestoreVm(crate::snapshot::RestoreConfig),
+
     /// Get the configuration of the microVM.
     GetVmConfiguration,
 
@@ -375,6 +381,7 @@ impl VmmService {
             VmmAction::PauseMicroVm => self.pause_microvm(vmm),
             VmmAction::ResumeMicroVm => self.resume_microvm(vmm),
             VmmAction::SnapshotVm(cfg) => self.snapshot_microvm(vmm, cfg),
+            VmmAction::RestoreVm(cfg) => self.restore_microvm(vmm, cfg),
             VmmAction::GetVmConfiguration => Ok(VmmData::MachineConfiguration(Box::new(
                 self.machine_config.clone(),
             ))),
@@ -571,6 +578,20 @@ impl VmmService {
         let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
         vm.snapshot_vm(&cfg)
             .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::Snapshot)
+    }
+
+    // POC (agent-substrate): see planning-repo issue I-007.
+    // Restores Phase-1 snapshot state onto an already-paused microVM.
+    #[instrument(skip(self))]
+    fn restore_microvm(
+        &mut self,
+        vmm: &mut Vmm,
+        cfg: crate::snapshot::RestoreConfig,
+    ) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.restore_vm(&cfg)
+            .map(|()| VmmData::Empty)
             .map_err(VmmActionError::Snapshot)
     }
 

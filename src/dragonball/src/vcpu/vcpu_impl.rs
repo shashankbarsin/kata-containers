@@ -204,6 +204,11 @@ pub enum VcpuEvent {
     /// The carried list of MSR indices is what the responding vCPU thread
     /// will read via `KVM_GET_MSRS` — see planning-repo ADR-0003.
     GetState(Vec<u32>),
+
+    /// Apply a previously captured vCPU register snapshot to this vCPU.
+    /// Paused-only — the vCPU thread calls `KVM_SET_REGS`/`KVM_SET_SREGS`/
+    /// `KVM_SET_MSRS`/`KVM_SET_CPUID2`. See planning-repo I-007.
+    SetState(Box<crate::snapshot::vcpu_state::VcpuStateData>),
 }
 
 /// List of responses that the Vcpu reports.
@@ -222,6 +227,8 @@ pub enum VcpuResponse {
     CacheRevalidated,
     /// Captured snapshot state for this vCPU.
     State(Box<crate::snapshot::vcpu_state::VcpuStateData>),
+    /// Successfully applied a `SetState` to this vCPU (I-007 restore).
+    StateSet,
 }
 
 #[derive(Debug, PartialEq)]
@@ -695,6 +702,12 @@ impl Vcpu {
                     .send(VcpuResponse::NotAllowed)
                     .expect("failed to send NotAllowed for GetState while running");
             }
+            Ok(VcpuEvent::SetState(_)) => {
+                // Snapshot apply is only permitted from the Paused state.
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed)
+                    .expect("failed to send NotAllowed for SetState while running");
+            }
             Ok(VcpuEvent::RevalidateCache) => {
                 self.revalidate_cache()
                     .map(|()| {
@@ -768,6 +781,29 @@ impl Vcpu {
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 {
+                    self.response_sender
+                        .send(VcpuResponse::NotAllowed)
+                        .expect("failed to send NotAllowed");
+                }
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::SetState(state)) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let resp = match crate::snapshot::vcpu_state::apply(&self.fd, &state) {
+                        Ok(()) => VcpuResponse::StateSet,
+                        Err(e) => {
+                            error!("vcpu {} snapshot apply failed: {e}", self.id);
+                            VcpuResponse::NotAllowed
+                        }
+                    };
+                    self.response_sender
+                        .send(resp)
+                        .expect("failed to send vcpu SetState ack");
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    let _ = state;
                     self.response_sender
                         .send(VcpuResponse::NotAllowed)
                         .expect("failed to send NotAllowed");

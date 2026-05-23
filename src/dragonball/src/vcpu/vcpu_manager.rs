@@ -527,6 +527,57 @@ impl VcpuManager {
         Ok(states)
     }
 
+    /// Inverse of [`Self::capture_vcpu_states`]: apply previously captured
+    /// register snapshots to the present vCPUs. The microVM must already be
+    /// paused. Used by the I-007 restore path.
+    pub fn restore_vcpu_states(
+        &mut self,
+        states: &[crate::snapshot::vcpu_state::VcpuStateData],
+    ) -> Result<()> {
+        let cpu_indexes = self.present_vcpus();
+        if cpu_indexes.len() != states.len() {
+            error!(
+                "restore vcpu count mismatch: vmm has {} vcpus, snapshot has {}",
+                cpu_indexes.len(),
+                states.len()
+            );
+            return Err(VcpuManagerError::VcpuSave);
+        }
+        for (idx, cpu_id) in cpu_indexes.iter().enumerate() {
+            let handle = self.vcpu_infos[*cpu_id as usize]
+                .handle
+                .as_ref()
+                .ok_or(VcpuManagerError::VcpuNotFound(*cpu_id))?;
+            handle
+                .send_event(VcpuEvent::SetState(Box::new(states[idx].clone())))
+                .map_err(VcpuManagerError::VcpuEvent)?;
+        }
+        for cpu_id in &cpu_indexes {
+            let handle = self.vcpu_infos[*cpu_id as usize]
+                .handle
+                .as_ref()
+                .ok_or(VcpuManagerError::VcpuNotFound(*cpu_id))?;
+            loop {
+                match handle
+                    .response_receiver()
+                    .recv_timeout(Duration::from_millis(CPU_RECV_TIMEOUT_MS))
+                {
+                    Ok(VcpuResponse::StateSet) => break,
+                    Ok(VcpuResponse::NotAllowed) | Ok(VcpuResponse::Error(_)) => {
+                        error!("vcpu {cpu_id} refused snapshot SetState");
+                        return Err(VcpuManagerError::VcpuSave);
+                    }
+                    Ok(_other) => continue,
+                    Err(e) => {
+                        error!("vcpu {cpu_id} SetState ack timed out: {e:?}");
+                        return Err(VcpuManagerError::VcpuResponseTimeout(e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// exit all vcpus, and never restart again
     pub fn exit_all_vcpus(&mut self) -> Result<()> {
         self.exit_vcpus(&self.present_vcpus())?;

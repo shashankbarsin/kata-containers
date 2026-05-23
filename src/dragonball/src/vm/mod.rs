@@ -555,9 +555,29 @@ impl Vm {
             size: mem_size_bytes,
         }];
 
-        // 4. write blob.
-        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &regions)
-            .map_err(VmError::Snapshot)?;
+        // 4. write blob, streaming guest memory page-chunks straight to disk.
+        let vm_as = self
+            .vm_as()
+            .cloned()
+            .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
+        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &regions, |idx, w| {
+            let r = regions[idx];
+            let vm_memory = vm_as.memory();
+            // Read in 1 MiB chunks so we don't materialize all of guest RAM
+            // in a single Vec; ADR-0003 \u00a7Snapshot writer.
+            let mut buf = vec![0u8; 1 << 20];
+            let mut offset: u64 = 0;
+            while offset < r.size {
+                let take = std::cmp::min(r.size - offset, buf.len() as u64) as usize;
+                vm_memory
+                    .read_slice(&mut buf[..take], GuestAddress(r.guest_phys_addr + offset))
+                    .map_err(|e| io::Error::other(format!("guest read: {e:?}")))?;
+                w.write_all(&buf[..take])?;
+                offset += take as u64;
+            }
+            Ok(())
+        })
+        .map_err(VmError::Snapshot)?;
         info!(
             self.logger,
             "VM: snapshot written";
@@ -567,6 +587,87 @@ impl Vm {
             "format_version" => metadata.format_version,
         );
         Ok(metadata)
+    }
+
+    /// Restore the microVM state from a snapshot blob.
+    ///
+    /// Phase-1 contract (planning-repo I-007): the microVM must already be
+    /// **booted and paused** when this is called. The substrate-side
+    /// `Vmm::restore` orchestrates `boot \u2192 pause \u2192 restore_vm` as a single
+    /// operation. The restore overlays the snapshot's memory pages onto the
+    /// running address space (CoW \u2014 the fresh-boot pages are dropped) and
+    /// applies the saved vCPU register state via `KVM_SET_REGS` /
+    /// `KVM_SET_SREGS` / `KVM_SET_MSRS` / `KVM_SET_CPUID2`.
+    ///
+    /// Caller must subsequently invoke `Vm::resume_all_vcpus_with_downtime`
+    /// to bring the guest back to Running with the injected state.
+    pub fn restore_vm(
+        &mut self,
+        cfg: &crate::snapshot::RestoreConfig,
+    ) -> std::result::Result<(), VmError> {
+        let mut reader = crate::snapshot::reader::SnapshotReader::open(&cfg.snapshot_path)
+            .map_err(VmError::Snapshot)?;
+
+        // Sanity-check the snapshot matches our current VM shape.
+        let mem_size_bytes = (self.vm_config.mem_size_mib as u64) << 20;
+        if reader.mem_size_bytes != mem_size_bytes {
+            return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                io::Error::other(format!(
+                    "snapshot mem_size {} != vm mem_size {}",
+                    reader.mem_size_bytes, mem_size_bytes
+                )),
+            )));
+        }
+        if reader.vcpu_count != self.vm_config.vcpu_count {
+            return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                io::Error::other(format!(
+                    "snapshot vcpu_count {} != vm vcpu_count {}",
+                    reader.vcpu_count, self.vm_config.vcpu_count
+                )),
+            )));
+        }
+
+        // Overlay memory pages onto the booted address space.
+        let vm_as = self
+            .vm_as()
+            .cloned()
+            .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
+        let region_count = reader.regions.len();
+        for region_idx in 0..region_count {
+            let descriptor = reader.regions[region_idx];
+            let mut offset: u64 = 0;
+            reader
+                .read_next_region(|chunk| {
+                    let vm_memory = vm_as.memory();
+                    vm_memory
+                        .write_slice(chunk, GuestAddress(descriptor.guest_phys_addr + offset))
+                        .map_err(|e| {
+                            crate::snapshot::SnapshotError::Io(io::Error::other(format!(
+                                "guest write: {e:?}"
+                            )))
+                        })?;
+                    offset += chunk.len() as u64;
+                    Ok(())
+                })
+                .map_err(VmError::Snapshot)?;
+        }
+        reader.check_trailer().map_err(VmError::Snapshot)?;
+
+        // Inject vCPU register state into the (paused) vCPU threads.
+        let vcpu_states = std::mem::take(&mut reader.vcpu_states);
+        {
+            let mut mgr = self.vcpu_manager()?;
+            mgr.restore_vcpu_states(&vcpu_states)?;
+        }
+
+        info!(
+            self.logger,
+            "VM: snapshot restored";
+            "path" => cfg.snapshot_path.display().to_string(),
+            "vcpu_count" => reader.vcpu_count,
+            "mem_size_bytes" => reader.mem_size_bytes,
+        );
+        Ok(())
     }
 
     pub(crate) fn init_devices(
