@@ -768,7 +768,7 @@ impl Vm {
     #[cfg(target_arch = "x86_64")]
     pub fn restore_microvm_fresh(
         &mut self,
-        _event_mgr: &mut EventManager,
+        event_mgr: &mut EventManager,
         seccomp_filters: HashMap<String, BpfProgram>,
         cfg: &crate::snapshot::RestoreConfig,
     ) -> std::result::Result<(), VmError> {
@@ -823,6 +823,29 @@ impl Vm {
             .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
                 format!("create_pit: {e:?}"),
             ))))?;
+
+        // 3b. Device manager: needed so the vCPU thread has a `reset_event_fd`
+        //     (unwrapped unconditionally in `create_vcpu_arch`) and so MMIO /
+        //     port-IO exits from the restored guest land on host-side
+        //     emulation handlers. Devices have no in-kernel state we'd
+        //     overwrite; they're configured from the same boot source the
+        //     snapshot was taken with.
+        self.init_devices(event_mgr.epoll_manager())
+            .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("init_devices: {e:?}"),
+            ))))?;
+        let reset_event_fd = self
+            .device_manager
+            .get_reset_eventfd()
+            .ok_or_else(|| {
+                VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                    "device_manager: missing reset_eventfd after init_devices",
+                )))
+            })?;
+        self.vcpu_manager()
+            .map_err(VmError::SnapshotVcpu)?
+            .set_reset_event_fd(reset_event_fd)
+            .map_err(VmError::SnapshotVcpu)?;
 
         // 4. Create vCPU fds. `entry_addr=GA(0)` is ignored because
         //    `restore_vm` will overwrite RIP/RSP/CR0/... via KVM_SET_REGS
