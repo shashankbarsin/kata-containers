@@ -837,9 +837,9 @@ impl Vm {
         let reset_event_fd = self
             .device_manager
             .get_reset_eventfd()
-            .ok_or_else(|| {
+            .map_err(|e| {
                 VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
-                    "device_manager: missing reset_eventfd after init_devices",
+                    format!("device_manager.get_reset_eventfd: {e:?}"),
                 )))
             })?;
         self.vcpu_manager()
