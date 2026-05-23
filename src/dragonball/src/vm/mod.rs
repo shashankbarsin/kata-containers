@@ -22,7 +22,7 @@ use seccompiler::BpfProgram;
 use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
+use vm_memory::{Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
