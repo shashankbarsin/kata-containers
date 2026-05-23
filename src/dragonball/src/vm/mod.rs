@@ -740,6 +740,125 @@ impl Vm {
         Ok(())
     }
 
+    /// Restore a snapshot **without first booting a kernel** (I-008b sub-step 2).
+    ///
+    /// This is the cold-restore primitive the POC is ultimately measuring.
+    /// It builds the minimum KVM scaffolding required to apply a snapshot
+    /// over —
+    ///
+    ///   1. anon guest RAM (will be mmap-overlaid by [`Self::restore_vm`]);
+    ///   2. KVM TSS;
+    ///   3. in-kernel irqchip (KVM_CREATE_IRQCHIP);
+    ///   4. in-kernel PIT (KVM_CREATE_PIT2);
+    ///   5. vCPU fds (via `create_boot_vcpus`);
+    ///   6. vCPU threads, spawned **paused** (`need_resume=false`).
+    ///
+    /// — and then defers to [`Self::restore_vm`] for the mmap overlay,
+    /// `vm_state::apply`, and `vcpu_state::apply`. Skipped vs.
+    /// [`Self::start_microvm`]: kernel ELF load, MPTable / cmdline / e820
+    /// (`init_configure_system`), in-guest device model wiring, upcall,
+    /// event registration, and the implicit vCPU resume that happens
+    /// after `start_boot_vcpus`. None of those produce state that survives
+    /// the snapshot/restore cycle — the snapshot pages already carry the
+    /// MPTable + kernel image, and the in-kernel KVM objects are
+    /// rehydrated from the snapshot's vm-level state block (v4).
+    ///
+    /// Caller must subsequently invoke
+    /// [`Self::resume_all_vcpus_with_downtime`] to start the guest.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_microvm_fresh(
+        &mut self,
+        _event_mgr: &mut EventManager,
+        seccomp_filters: HashMap<String, BpfProgram>,
+        cfg: &crate::snapshot::RestoreConfig,
+    ) -> std::result::Result<(), VmError> {
+        info!(self.logger, "VM: restore_microvm_fresh starting");
+
+        if self.is_vm_initialized() {
+            return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                io::Error::other("restore_microvm_fresh: VM is already initialized"),
+            )));
+        }
+        self.shared_info
+            .write()
+            .expect("Failed to update shared info: poisoned lock")
+            .state = InstanceState::Starting;
+
+        let request_ts = TimestampUs::default();
+        self.start_instance_request_ts = request_ts.time_us;
+        self.start_instance_request_cpu_ts = request_ts.cputime_us;
+
+        // 1. Anon guest RAM (KVM_USER_MEMORY_REGION). The pages will be
+        //    discarded as `restore_vm` MAP_FIXED-overlays them with
+        //    file-backed MAP_PRIVATE mappings from the snapshot blob.
+        self.init_guest_memory()
+            .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("init_guest_memory: {e:?}"),
+            ))))?;
+        let vm_as = self
+            .vm_as()
+            .cloned()
+            .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
+
+        // 2. vCPU manager (channel infra; no threads yet).
+        self.init_vcpu_manager(
+            vm_as,
+            seccomp_filters.get(VCPU_THREAD).cloned().unwrap_or_default(),
+        )
+        .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+            format!("init_vcpu_manager: {e:?}"),
+        ))))?;
+
+        // 3. KVM in-kernel objects whose state we restore from v4 vm_state.
+        //    These must exist before KVM_SET_IRQCHIP / KVM_SET_PIT2 will succeed.
+        self.init_tss()
+            .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("init_tss: {e:?}"),
+            ))))?;
+        self.setup_interrupt_controller()
+            .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("setup_interrupt_controller: {e:?}"),
+            ))))?;
+        self.create_pit()
+            .map_err(|e| VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                format!("create_pit: {e:?}"),
+            ))))?;
+
+        // 4. Create vCPU fds. `entry_addr=GA(0)` is ignored because
+        //    `restore_vm` will overwrite RIP/RSP/CR0/... via KVM_SET_REGS
+        //    and KVM_SET_SREGS from the snapshot's per-vCPU blob.
+        self.vcpu_manager()
+            .map_err(VmError::SnapshotVcpu)?
+            .create_boot_vcpus(request_ts, GuestAddress(0))
+            .map_err(VmError::SnapshotVcpu)?;
+
+        // 5. Spawn vCPU threads in Paused state (`need_resume=false`).
+        //    Threads enter their event loop but do NOT call KVM_RUN until
+        //    a Resume event arrives. This is the window in which
+        //    `restore_vm`'s `restore_vcpu_states` sends SetState over the
+        //    per-vCPU channel.
+        let boot_vcpu_count = self.vm_config.vcpu_count;
+        self.vcpu_manager()
+            .map_err(VmError::SnapshotVcpu)?
+            .start_vcpus(
+                boot_vcpu_count,
+                seccomp_filters.get(VMM_THREAD).cloned().unwrap_or_default(),
+                false,
+            )
+            .map_err(VmError::SnapshotVcpu)?;
+
+        // 6. Shared mmap-overlay + vm_state::apply + vcpu_state::apply path.
+        self.restore_vm(cfg)?;
+
+        self.shared_info
+            .write()
+            .expect("Failed to update shared info: poisoned lock")
+            .state = InstanceState::Running;
+
+        info!(self.logger, "VM: restore_microvm_fresh complete");
+        Ok(())
+    }
+
     pub(crate) fn init_devices(
         &mut self,
         epoll_manager: EpollManager,
