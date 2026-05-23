@@ -213,6 +213,15 @@ pub enum VmmAction {
     /// with the injected register/memory state.
     RestoreVm(crate::snapshot::RestoreConfig),
 
+    /// POC (agent-substrate planning-repo I-008b): cold restore — build
+    /// just enough KVM scaffolding (anon RAM, irqchip, PIT2, paused vCPU
+    /// threads) without booting a kernel, then overlay the snapshot. The
+    /// VM lands in `Running` (vCPU threads alive but paused). Caller sends
+    /// `ResumeMicroVm` to start the guest. Requires `SetVmConfiguration`
+    /// to have already set vcpu_count + mem_size_mib matching the
+    /// snapshot.
+    RestoreVmFresh(crate::snapshot::RestoreConfig),
+
     /// Get the configuration of the microVM.
     GetVmConfiguration,
 
@@ -382,6 +391,7 @@ impl VmmService {
             VmmAction::ResumeMicroVm => self.resume_microvm(vmm),
             VmmAction::SnapshotVm(cfg) => self.snapshot_microvm(vmm, cfg),
             VmmAction::RestoreVm(cfg) => self.restore_microvm(vmm, cfg),
+            VmmAction::RestoreVmFresh(cfg) => self.restore_microvm_fresh(vmm, event_mgr, cfg),
             VmmAction::GetVmConfiguration => Ok(VmmData::MachineConfiguration(Box::new(
                 self.machine_config.clone(),
             ))),
@@ -591,6 +601,23 @@ impl VmmService {
     ) -> VmmRequestResult {
         let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
         vm.restore_vm(&cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::Snapshot)
+    }
+
+    // POC (agent-substrate): see planning-repo issue I-008b.
+    // Builds bare KVM scaffolding (no kernel boot) and overlays the
+    // snapshot. VM lands in Running with paused vCPU threads.
+    #[instrument(skip(self, event_mgr))]
+    fn restore_microvm_fresh(
+        &mut self,
+        vmm: &mut Vmm,
+        event_mgr: &mut EventManager,
+        cfg: crate::snapshot::RestoreConfig,
+    ) -> VmmRequestResult {
+        let seccomp_filters = vmm.seccomp_filters();
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.restore_microvm_fresh(event_mgr, seccomp_filters, &cfg)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::Snapshot)
     }
