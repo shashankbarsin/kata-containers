@@ -199,6 +199,11 @@ pub enum VcpuEvent {
 
     /// Event to revalidate vcpu IoManager cache
     RevalidateCache,
+
+    /// Capture vCPU register state for snapshotting (POC, paused-only).
+    /// The carried list of MSR indices is what the responding vCPU thread
+    /// will read via `KVM_GET_MSRS` — see planning-repo ADR-0003.
+    GetState(Vec<u32>),
 }
 
 /// List of responses that the Vcpu reports.
@@ -215,6 +220,8 @@ pub enum VcpuResponse {
     Error(VcpuError),
     /// Vcpu IoManager cache is revalidated
     CacheRevalidated,
+    /// Captured snapshot state for this vCPU.
+    State(Box<crate::snapshot::vcpu_state::VcpuStateData>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -682,6 +689,12 @@ impl Vcpu {
                     .send(VcpuResponse::Tid(self.cpu_index(), Vcpu::gettid()))
                     .expect("failed to send vcpu thread tid");
             }
+            Ok(VcpuEvent::GetState(_)) => {
+                // Snapshot capture is only permitted from the Paused state.
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed)
+                    .expect("failed to send NotAllowed for GetState while running");
+            }
             Ok(VcpuEvent::RevalidateCache) => {
                 self.revalidate_cache()
                     .map(|()| {
@@ -731,6 +744,34 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Tid(self.cpu_index(), Vcpu::gettid()))
                     .expect("failed to send vcpu thread tid");
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::GetState(_msr_indices)) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let cpuid_entries = self.cpuid.as_slice().to_vec();
+                    let resp = match crate::snapshot::vcpu_state::capture(
+                        self.id,
+                        &self.fd,
+                        &cpuid_entries,
+                        &_msr_indices,
+                    ) {
+                        Ok(state) => VcpuResponse::State(Box::new(state)),
+                        Err(e) => {
+                            error!("vcpu {} snapshot capture failed: {e}", self.id);
+                            VcpuResponse::NotAllowed
+                        }
+                    };
+                    self.response_sender
+                        .send(resp)
+                        .expect("failed to send vcpu snapshot state");
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    self.response_sender
+                        .send(VcpuResponse::NotAllowed)
+                        .expect("failed to send NotAllowed");
+                }
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::RevalidateCache) => {

@@ -39,6 +39,9 @@ pub mod vcpu;
 /// Virtual machine manager for virtual machines.
 pub mod vm;
 
+/// Snapshot / restore primitive (POC — see planning-repo ADR-0003).
+pub mod snapshot;
+
 mod event_manager;
 mod io_manager;
 

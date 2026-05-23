@@ -80,6 +80,18 @@ pub enum VmError {
     #[cfg(target_arch = "aarch64")]
     #[error("failed to setup pmu device")]
     SetupPmu(#[source] PmuError),
+
+    /// Snapshot subsystem error (ATEOM POC, see planning-repo ADR-0003).
+    #[error("snapshot subsystem error: {0}")]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
+
+    /// KVM ioctl failed while collecting snapshot metadata.
+    #[error("snapshot prep KVM ioctl failed: {0}")]
+    SnapshotKvm(#[source] kvm_ioctls::Error),
+
+    /// vCPU manager refused to capture state for snapshot.
+    #[error("vcpu manager error during snapshot: {0}")]
+    SnapshotVcpu(#[from] crate::vcpu::VcpuManagerError),
 }
 
 /// Configuration information for user defined NUMA nodes.
@@ -498,6 +510,65 @@ impl Vm {
         Ok(())
     }
 
+    /// Write a Phase-1 stub snapshot to disk.
+    ///
+    /// The vCPUs **must** already be paused (this is enforced by the API
+    /// dispatcher in `vmm_action.rs`). The flow is:
+    ///
+    /// 1. Look up the host's supported MSR index list from `KvmContext`.
+    /// 2. Send `VcpuEvent::GetState` to every present vCPU and collect their
+    ///    register snapshots.
+    /// 3. Enumerate guest memory regions (Phase 1: one descriptor covering
+    ///    the full configured RAM size).
+    /// 4. Hand off to [`crate::snapshot::write_snapshot`] which writes the
+    ///    ATEOMSN1 blob with explicit magic, version, and trailer.
+    ///
+    /// See planning-repo ADR-0003 for the rationale and the future evolution
+    /// of this primitive (device state, dirty-bitmap-driven diff snapshots,
+    /// bincode encoding).
+    pub fn snapshot_vm(
+        &mut self,
+        cfg: &crate::snapshot::SnapshotConfig,
+    ) -> std::result::Result<crate::snapshot::metadata::SnapshotMetadata, VmError> {
+        // 1. supported MSR indices (x86_64 only).
+        #[cfg(target_arch = "x86_64")]
+        let msr_indices: Vec<u32> = {
+            let msr_list = self
+                .kvm
+                .supported_msrs(0)
+                .map_err(VmError::SnapshotKvm)?;
+            msr_list.as_slice().to_vec()
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let msr_indices: Vec<u32> = Vec::new();
+
+        // 2. per-vCPU state.
+        let vcpu_states = {
+            let mut mgr = self.vcpu_manager()?;
+            mgr.capture_vcpu_states(&msr_indices)?
+        };
+
+        // 3. memory region descriptors. Phase 1: one entry spanning all RAM.
+        let mem_size_bytes = (self.vm_config.mem_size_mib as u64) << 20;
+        let regions = vec![crate::snapshot::MemoryRegionDescriptor {
+            guest_phys_addr: 0,
+            size: mem_size_bytes,
+        }];
+
+        // 4. write blob.
+        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &regions)
+            .map_err(VmError::Snapshot)?;
+        info!(
+            self.logger,
+            "VM: snapshot written";
+            "path" => cfg.snapshot_path.display().to_string(),
+            "vcpu_count" => metadata.vcpu_count,
+            "mem_size_bytes" => metadata.mem_size_bytes,
+            "format_version" => metadata.format_version,
+        );
+        Ok(metadata)
+    }
+
     pub(crate) fn init_devices(
         &mut self,
         epoll_manager: EpollManager,
@@ -624,6 +695,11 @@ impl Vm {
             .map_err(StartMicroVmError::AddressManagerError)?;
         address_space_param.set_kvm_vm_fd(self.vm_fd.clone());
         address_space_param.toggle_use_firmware(self.firmware_type.is_some());
+        // ATEOM POC (I-006): always enable KVM dirty-page logging so that the
+        // snapshot subsystem can observe writes via `KVM_GET_DIRTY_LOG`. The
+        // overhead is negligible for the workload profiles we target and we
+        // never run a Dragonball microVM without expecting to snapshot it.
+        address_space_param.toggle_dirty_page_logging(true);
         #[cfg(target_arch = "x86_64")]
         address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
         self.address_space

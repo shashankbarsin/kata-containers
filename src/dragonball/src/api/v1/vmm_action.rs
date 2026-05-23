@@ -167,6 +167,11 @@ pub enum VmmActionError {
     /// The action `PauseMicroVm` or `ResumeMicroVm` failed.
     #[error("failed to pause/resume vcpus: {0}")]
     PauseResume(#[source] VcpuManagerError),
+
+    // POC (agent-substrate): see planning-repo issue I-006.
+    /// The action `SnapshotVm` failed.
+    #[error("failed to snapshot vm: {0}")]
+    Snapshot(#[source] crate::vm::VmError),
 }
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -195,6 +200,12 @@ pub enum VmmAction {
     /// Resume all vCPUs of a paused microVM. Can only be called after a
     /// successful [`VmmAction::PauseMicroVm`].
     ResumeMicroVm,
+
+    // POC (agent-substrate): see planning-repo issue I-006.
+    /// Capture a Phase-1 stub snapshot of the paused microVM and write it to
+    /// disk at the path carried by [`crate::snapshot::SnapshotConfig`]. The
+    /// vCPUs must already be paused (call [`VmmAction::PauseMicroVm`] first).
+    SnapshotVm(crate::snapshot::SnapshotConfig),
 
     /// Get the configuration of the microVM.
     GetVmConfiguration,
@@ -363,6 +374,7 @@ impl VmmService {
             // POC (agent-substrate): see planning-repo issue I-005.
             VmmAction::PauseMicroVm => self.pause_microvm(vmm),
             VmmAction::ResumeMicroVm => self.resume_microvm(vmm),
+            VmmAction::SnapshotVm(cfg) => self.snapshot_microvm(vmm, cfg),
             VmmAction::GetVmConfiguration => Ok(VmmData::MachineConfiguration(Box::new(
                 self.machine_config.clone(),
             ))),
@@ -544,6 +556,22 @@ impl VmmService {
         vm.resume_all_vcpus_with_downtime()
             .map(|_| VmmData::Empty)
             .map_err(VmmActionError::PauseResume)
+    }
+
+    // POC (agent-substrate): see planning-repo issue I-006.
+    // Captures a Phase-1 stub snapshot to `cfg.snapshot_path`. The microVM
+    // must already be paused (otherwise the per-vCPU `GetState` event will be
+    // rejected by the still-running state machine).
+    #[instrument(skip(self))]
+    fn snapshot_microvm(
+        &mut self,
+        vmm: &mut Vmm,
+        cfg: crate::snapshot::SnapshotConfig,
+    ) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.snapshot_vm(&cfg)
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::Snapshot)
     }
 
     /// Get prometheus metrics.

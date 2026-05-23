@@ -31,7 +31,7 @@ use dbs_allocator::Constraint;
 use dbs_boot::layout::{BIOS_MEM_SIZE, BIOS_MEM_START};
 use kvm_bindings::{
     kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
-    KVM_MEM_GUEST_MEMFD,
+    KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES,
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
@@ -460,6 +460,13 @@ impl AddressSpaceMgr {
                 .get_host_address(MemoryRegionAddress(0))
                 .map_err(|_e| AddressManagerError::InvalidOperation)?;
             let mut flags = 0u32;
+            // ATEOM POC (I-006): wire `dirty_page_logging` through to KVM so that
+            // `KVM_GET_DIRTY_LOG` returns meaningful results. Required for the
+            // diff component of the golden+diff snapshot primitive (see
+            // planning-repo ADR-0003).
+            if param.dirty_page_logging {
+                flags |= KVM_MEM_LOG_DIRTY_PAGES;
+            }
 
             #[cfg(not(target_arch = "x86_64"))]
             let kvm_guest_memfd = false;

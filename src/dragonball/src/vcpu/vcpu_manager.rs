@@ -464,6 +464,69 @@ impl VcpuManager {
         self.resume_vcpus(&self.present_vcpus())
     }
 
+    /// Capture a snapshot of every present vCPU's register state.
+    ///
+    /// All vCPUs **must** already be in the `Paused` state (call
+    /// [`Vm::pause_all_vcpus_with_downtime`](crate::vm::Vm::pause_all_vcpus_with_downtime)
+    /// first). Each vCPU thread responds to a [`VcpuEvent::GetState`] event by
+    /// calling `KVM_GET_REGS` / `KVM_GET_SREGS` / `KVM_GET_MSRS` /
+    /// `KVM_GET_CPUID2`; the per-vCPU MSR index list passed in is what the
+    /// kernel reports as supported on the host.
+    ///
+    /// POC scope (planning-repo ADR-0003): we drain leading non-State
+    /// responses on the channel so that a stale `Paused` left over from
+    /// `pause_vcpus` does not poison the read.
+    pub fn capture_vcpu_states(
+        &mut self,
+        msr_indices: &[u32],
+    ) -> Result<Vec<crate::snapshot::vcpu_state::VcpuStateData>> {
+        let cpu_indexes = self.present_vcpus();
+
+        for cpu_id in &cpu_indexes {
+            if let Some(handle) = &self.vcpu_infos[*cpu_id as usize].handle {
+                handle
+                    .send_event(VcpuEvent::GetState(msr_indices.to_vec()))
+                    .map_err(VcpuManagerError::VcpuEvent)?;
+            } else {
+                return Err(VcpuManagerError::VcpuNotFound(*cpu_id));
+            }
+        }
+
+        let mut states = Vec::with_capacity(cpu_indexes.len());
+        for cpu_id in &cpu_indexes {
+            let handle = self.vcpu_infos[*cpu_id as usize]
+                .handle
+                .as_ref()
+                .ok_or(VcpuManagerError::VcpuNotFound(*cpu_id))?;
+            // Drain stale responses (Paused / Resumed / CacheRevalidated)
+            // until we find our State payload, bounded by the channel timeout.
+            loop {
+                match handle
+                    .response_receiver()
+                    .recv_timeout(Duration::from_millis(CPU_RECV_TIMEOUT_MS))
+                {
+                    Ok(VcpuResponse::State(s)) => {
+                        states.push(*s);
+                        break;
+                    }
+                    Ok(VcpuResponse::NotAllowed) | Ok(VcpuResponse::Error(_)) => {
+                        error!("vcpu {cpu_id} refused snapshot state capture");
+                        return Err(VcpuManagerError::VcpuSave);
+                    }
+                    Ok(_other) => {
+                        // Stale Paused/Resumed/CacheRevalidated/Tid \u2014 keep draining.
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("vcpu {cpu_id} snapshot state recv timed out: {e:?}");
+                        return Err(VcpuManagerError::VcpuResponseTimeout(e));
+                    }
+                }
+            }
+        }
+        Ok(states)
+    }
+
     /// exit all vcpus, and never restart again
     pub fn exit_all_vcpus(&mut self) -> Result<()> {
         self.exit_vcpus(&self.present_vcpus())?;
