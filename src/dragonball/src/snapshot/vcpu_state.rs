@@ -104,7 +104,7 @@ pub fn capture(
         msrs: slice_to_bytes(msr_entries),
         cpuid_entries: slice_to_bytes(cpuid_entries),
         lapic: struct_to_bytes(&lapic),
-        xsave: struct_to_bytes(&xsave),
+        xsave: any_struct_to_bytes(&xsave),
         vcpu_events: struct_to_bytes(&vcpu_events),
         mp_state: struct_to_bytes(&mp_state),
     })
@@ -128,6 +128,21 @@ pub fn capture(
 #[cfg(target_arch = "x86_64")]
 fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
     // Safe: T is a #[repr(C)] POD KVM struct, and we only read it.
+    let slice = unsafe {
+        std::slice::from_raw_parts(
+            value as *const T as *const u8,
+            std::mem::size_of::<T>(),
+        )
+    };
+    slice.to_vec()
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Like [`struct_to_bytes`] but doesn't require `T: Copy`. Some KVM bindings
+/// (notably `kvm_xsave`) contain large inline arrays whose Copy impl was
+/// elided by bindgen; the on-disk byte representation is still well-defined
+/// because the struct is `#[repr(C)]`.
+fn any_struct_to_bytes<T>(value: &T) -> Vec<u8> {
     let slice = unsafe {
         std::slice::from_raw_parts(
             value as *const T as *const u8,
@@ -231,9 +246,18 @@ pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
 
     // 6. XSAVE.
     if state.xsave.len() == size_of::<kvm_xsave>() {
-        let xsave: kvm_xsave =
-            unsafe { std::ptr::read(state.xsave.as_ptr() as *const kvm_xsave) };
-        fd.set_xsave(&xsave)?;
+        let mut xsave: kvm_xsave = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                state.xsave.as_ptr(),
+                &mut xsave as *mut kvm_xsave as *mut u8,
+                size_of::<kvm_xsave>(),
+            );
+        }
+        // SAFETY: the snapshot blob was produced by KVM_GET_XSAVE on a
+        // compatible host; we round-trip the exact byte layout back to
+        // KVM_SET_XSAVE.
+        unsafe { fd.set_xsave(&xsave)? };
     }
 
     // 7. VCPU_EVENTS (pending exceptions/NMI; do last so they aren't

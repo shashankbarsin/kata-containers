@@ -37,7 +37,7 @@ pub struct VmStateData {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
+fn struct_to_bytes<T>(value: &T) -> Vec<u8> {
     let slice = unsafe {
         std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
     };
