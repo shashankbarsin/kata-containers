@@ -162,6 +162,11 @@ pub enum VmmActionError {
     /// The action 'RemoveHostDevice' failed because of vcpu manager internal error.
     #[error("remove host device error: {0}")]
     RemoveHostDevice(#[source] VcpuManagerError),
+
+    // POC (agent-substrate): see planning-repo issue I-005.
+    /// The action `PauseMicroVm` or `ResumeMicroVm` failed.
+    #[error("failed to pause/resume vcpus: {0}")]
+    PauseResume(#[source] VcpuManagerError),
 }
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -179,6 +184,17 @@ pub enum VmmAction {
     /// When vmm is used as the crate by the other process, which is need to
     /// shutdown the vcpu threads and destory all of the object.
     ShutdownMicroVm,
+
+    // POC (agent-substrate): see planning-repo issue I-005.
+    /// Pause all vCPUs of a running microVM. Can only be called when the
+    /// microVM is running. On success the microVM is paused and vCPU threads
+    /// stop executing guest code until [`VmmAction::ResumeMicroVm`] is sent.
+    PauseMicroVm,
+
+    // POC (agent-substrate): see planning-repo issue I-005.
+    /// Resume all vCPUs of a paused microVM. Can only be called after a
+    /// successful [`VmmAction::PauseMicroVm`].
+    ResumeMicroVm,
 
     /// Get the configuration of the microVM.
     GetVmConfiguration,
@@ -344,6 +360,9 @@ impl VmmService {
             }
             VmmAction::StartMicroVm => self.start_microvm(vmm, event_mgr),
             VmmAction::ShutdownMicroVm => self.shutdown_microvm(vmm),
+            // POC (agent-substrate): see planning-repo issue I-005.
+            VmmAction::PauseMicroVm => self.pause_microvm(vmm),
+            VmmAction::ResumeMicroVm => self.resume_microvm(vmm),
             VmmAction::GetVmConfiguration => Ok(VmmData::MachineConfiguration(Box::new(
                 self.machine_config.clone(),
             ))),
@@ -502,6 +521,29 @@ impl VmmService {
         vmm.event_ctx.exit_evt_triggered = true;
 
         Ok(VmmData::Empty)
+    }
+
+    // POC (agent-substrate): see planning-repo issue I-005.
+    // Pauses every vCPU thread in the running microVM via the existing
+    // `Vm::pause_all_vcpus_with_downtime` helper. The microVM must already be
+    // initialized (i.e. `StartMicroVm` returned Ok); otherwise we map to
+    // `VcpuManagerError::VcpuManagerNotInitialized`.
+    #[instrument(skip(self))]
+    fn pause_microvm(&mut self, vmm: &mut Vmm) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.pause_all_vcpus_with_downtime()
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::PauseResume)
+    }
+
+    // POC (agent-substrate): see planning-repo issue I-005.
+    // Resumes every vCPU thread paused by a prior `PauseMicroVm`.
+    #[instrument(skip(self))]
+    fn resume_microvm(&mut self, vmm: &mut Vmm) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.resume_all_vcpus_with_downtime()
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::PauseResume)
     }
 
     /// Get prometheus metrics.
