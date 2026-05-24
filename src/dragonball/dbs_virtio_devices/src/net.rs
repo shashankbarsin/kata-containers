@@ -692,6 +692,26 @@ impl<AS: GuestAddressSpace> Net<AS> {
     pub fn metrics(&self) -> Arc<NetDeviceMetrics> {
         self.metrics.clone()
     }
+
+    /// Negotiated feature bits acknowledged by the guest driver
+    /// (planning-repo audit I-003 Phase 2). Captured at snapshot time
+    /// and reapplied on restore so that, after a synthesized
+    /// activation, the inner device honours the same feature set the
+    /// guest negotiated before the snapshot.
+    pub fn acked_features(&self) -> u64 {
+        self.device_info.acked_features()
+    }
+
+    /// Replace the negotiated feature bits in one call (used on the
+    /// restore path before invoking `MmioV2Device::restore_activate`).
+    ///
+    /// Unlike `VirtioDeviceInfo::set_acked_features` (which is bit-OR
+    /// additive to model a guest making incremental ACKs across MMIO
+    /// writes), this writes an absolute value — the snapshot owns the
+    /// authoritative feature set.
+    pub fn set_acked_features_full(&mut self, value: u64) {
+        self.device_info.acked_features = value;
+    }
 }
 
 impl<AS: GuestAddressSpace + 'static> Net<AS> {

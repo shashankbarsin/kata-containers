@@ -36,11 +36,14 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// after the legacy-device state block. Phase 1 captures per-device
 /// interface spec (iface_id, host TAP name, MAC, queue geometry); Phase
 /// 2 will extend the per-device payload with live queue cursors + ring
-/// GPAs + negotiated features. The envelope is itself a single
-/// length-prefixed blob, so v7 readers can ignore unknown trailing bytes
-/// inside a device record once Phase 2 lands without another version
-/// bump.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 7;
+/// GPAs + negotiated features.
+/// Bumped to 8 (I-003 Phase 2): per-device record gains `acked_features`
+/// and a per-queue array carrying ring GPAs (`desc_table`, `avail_ring`,
+/// `used_ring`), `ready`, `event_idx_enabled`, `next_avail`, `next_used`,
+/// and `size`. This is the minimum state needed for a synthesized
+/// post-restore device activation (re-binding the TAP to the virtio-net
+/// queues without the guest re-issuing the MMIO config writes).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 8;
 
 /// Page size assumed by the v3 alignment scheme. Matches every architecture
 /// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.

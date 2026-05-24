@@ -156,6 +156,46 @@ where
         self.state().get_inner_device().device_type()
     }
 
+    /// Synthesize the post-restore activation that the guest driver's
+    /// MMIO writes would normally trigger (planning-repo audit I-003
+    /// Phase 2).
+    ///
+    /// On a fresh boot the guest steps through the virtio status state
+    /// machine (`ACKNOWLEDGE → DRIVER → FEATURES_OK → DRIVER_OK`); the
+    /// final `DRIVER_OK` write is what currently invokes
+    /// `MmioV2DeviceState::activate`, which registers ioeventfds,
+    /// enables the interrupt manager, and calls the inner device's
+    /// `VirtioDevice::activate`. After a snapshot/restore the guest
+    /// believes the device is already configured and never re-issues
+    /// those writes, so the host-side device sits in `DEVICE_INIT` with
+    /// no epoll handler bound.
+    ///
+    /// This method drives the same path explicitly. Callers must:
+    /// 1. Apply per-queue ring GPAs / cursors via
+    ///    `MmioV2DeviceState::apply_queue_snapshot_states` first.
+    /// 2. Apply negotiated features on the inner device (e.g.
+    ///    `Net::set_acked_features_full`) first.
+    /// 3. Only then invoke `restore_activate`.
+    pub fn restore_activate(&self) -> Result<()> {
+        // Idempotent: if a previous restore already activated this
+        // device, do nothing.
+        if self.state().device_activated() {
+            return Ok(());
+        }
+        // Drive the status machine directly to DRIVER_OK. This is the
+        // restore-only fast-path; the normal MMIO-write state machine
+        // (see `update_driver_status`) requires step-by-step
+        // transitions, but those steps have no side-effects beyond
+        // updating the status register itself.
+        self.driver_status
+            .store(DEVICE_STATUS_DRIVER_OK, Ordering::SeqCst);
+        let mut state = self.state();
+        state.activate(self).inspect_err(|e| {
+            warn!("restore_activate: device activation failed: {e:?}");
+            self.set_driver_failed();
+        })
+    }
+
     pub(crate) fn interrupt_status(&self) -> Arc<InterruptStatusRegister32> {
         self.interrupt_status.clone()
     }
