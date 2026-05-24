@@ -585,38 +585,104 @@ impl Vm {
         #[cfg(not(feature = "virtio-net"))]
         let virtio_net_state = crate::snapshot::virtio_net_state::VirtioNetState::default();
 
-        // 4. write blob, streaming guest memory page-chunks straight to disk.
+        // 4. write blob. Golden streams full region contents; Diff queries
+        //    KVM_GET_DIRTY_LOG per region and emits the bitmap + dirty-page
+        //    payloads (audit I-004 Phase 2).
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let mut golden_source = |idx: usize, w: &mut dyn std::io::Write| -> std::io::Result<()> {
-            let r = regions[idx];
-            let vm_memory = vm_as.memory();
-            // Read in 1 MiB chunks so we don't materialize all of guest RAM
-            // in a single Vec; ADR-0003 \u00a7Snapshot writer.
-            let mut buf = vec![0u8; 1 << 20];
-            let mut offset: u64 = 0;
-            while offset < r.size {
-                let take = std::cmp::min(r.size - offset, buf.len() as u64) as usize;
-                vm_memory
-                    .read_slice(&mut buf[..take], GuestAddress(r.guest_phys_addr + offset))
-                    .map_err(|e| io::Error::other(format!("guest read: {e:?}")))?;
-                w.write_all(&buf[..take])?;
-                offset += take as u64;
+        let metadata = match cfg.kind {
+            crate::snapshot::metadata::SnapshotKind::Golden => {
+                let mut golden_source =
+                    |idx: usize, w: &mut dyn std::io::Write| -> std::io::Result<()> {
+                        let r = regions[idx];
+                        let vm_memory = vm_as.memory();
+                        // Read in 1 MiB chunks so we don't materialize all
+                        // of guest RAM in a single Vec; ADR-0003
+                        // \u00a7Snapshot writer.
+                        let mut buf = vec![0u8; 1 << 20];
+                        let mut offset: u64 = 0;
+                        while offset < r.size {
+                            let take =
+                                std::cmp::min(r.size - offset, buf.len() as u64) as usize;
+                            vm_memory
+                                .read_slice(
+                                    &mut buf[..take],
+                                    GuestAddress(r.guest_phys_addr + offset),
+                                )
+                                .map_err(|e| io::Error::other(format!("guest read: {e:?}")))?;
+                            w.write_all(&buf[..take])?;
+                            offset += take as u64;
+                        }
+                        Ok(())
+                    };
+                crate::snapshot::write_snapshot(
+                    cfg,
+                    &vcpu_states,
+                    &vm_state,
+                    &legacy_state,
+                    &virtio_net_state,
+                    &regions,
+                    crate::snapshot::SnapshotSource::Golden(&mut golden_source),
+                )
+                .map_err(VmError::Snapshot)?
             }
-            Ok(())
+            crate::snapshot::metadata::SnapshotKind::Diff => {
+                // Look up each region's KVM memslot via the address-space
+                // manager's GPA -> slot map (populated by `map_to_kvm`).
+                let slot_map = self.address_space.get_base_to_slot_map();
+                let slot_map = slot_map.lock().unwrap();
+                let mut bitmaps: Vec<Vec<u64>> = Vec::with_capacity(regions.len());
+                for r in &regions {
+                    let slot = *slot_map.get(&r.guest_phys_addr).ok_or_else(|| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                            io::Error::other(format!(
+                                "no KVM slot mapped at GPA {:#x}; \
+                                 was dirty_page_logging enabled at boot?",
+                                r.guest_phys_addr
+                            )),
+                        ))
+                    })?;
+                    let bitmap = crate::snapshot::kvm_dirty_tracker::get_dirty_log(
+                        self.vm_fd(),
+                        slot,
+                        r.size as usize,
+                    )
+                    .map_err(|e| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                            io::Error::other(format!("get_dirty_log: {e}")),
+                        ))
+                    })?;
+                    bitmaps.push(bitmap);
+                }
+                drop(slot_map);
+                let mut read_page = |region_idx: usize, page_idx: u64| -> std::io::Result<Vec<u8>> {
+                    let r = regions[region_idx];
+                    let vm_memory = vm_as.memory();
+                    let page_size = crate::snapshot::metadata::SNAPSHOT_PAGE_SIZE;
+                    let mut buf = vec![0u8; page_size as usize];
+                    let gpa = r.guest_phys_addr + page_idx * page_size;
+                    vm_memory
+                        .read_slice(&mut buf, GuestAddress(gpa))
+                        .map_err(|e| io::Error::other(format!("guest read: {e:?}")))?;
+                    Ok(buf)
+                };
+                crate::snapshot::write_snapshot(
+                    cfg,
+                    &vcpu_states,
+                    &vm_state,
+                    &legacy_state,
+                    &virtio_net_state,
+                    &regions,
+                    crate::snapshot::SnapshotSource::Diff {
+                        bitmaps: &bitmaps,
+                        read_page: &mut read_page,
+                    },
+                )
+                .map_err(VmError::Snapshot)?
+            }
         };
-        let metadata = crate::snapshot::write_snapshot(
-            cfg,
-            &vcpu_states,
-            &vm_state,
-            &legacy_state,
-            &virtio_net_state,
-            &regions,
-            crate::snapshot::SnapshotSource::Golden(&mut golden_source),
-        )
-        .map_err(VmError::Snapshot)?;
         info!(
             self.logger,
             "VM: snapshot written";
