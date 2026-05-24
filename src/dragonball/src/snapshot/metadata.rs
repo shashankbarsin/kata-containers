@@ -26,7 +26,13 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// (PIC master/slave, IOAPIC, PIT2, KVM_CLOCK) is written between the
 /// region descriptor table and the header padding. This is the minimum
 /// state needed for a no-boot mmap restore.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+/// Bumped to 5 in I-008c-3b: per-vCPU records gain an `xcrs` blob so XCR0
+/// (AVX-enable bit) survives restore — fixes post-restore #UD on AVX insns.
+/// Bumped to 6 in I-008c-3c: legacy-device state block (COM1 / COM2
+/// 8250-UART register + FIFO) written after the VM-level state block, so
+/// the post-restore UART honours IER and asserts COM1 IRQ on host→guest
+/// `raw_input`.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 6;
 
 /// Page size assumed by the v3 alignment scheme. Matches every architecture
 /// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.
