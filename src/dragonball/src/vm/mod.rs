@@ -576,12 +576,21 @@ impl Vm {
             s
         };
 
+        // 3d. Virtio-net device state (planning-repo audit I-003, Phase 1).
+        //     Captures per-device interface spec; queue cursors land in
+        //     Phase 2. Always emitted when the feature is enabled; empty
+        //     envelope (0 devices) for VMs without virtio-net.
+        #[cfg(feature = "virtio-net")]
+        let virtio_net_state = self.device_manager.virtio_net_manager.snapshot_devices();
+        #[cfg(not(feature = "virtio-net"))]
+        let virtio_net_state = crate::snapshot::virtio_net_state::VirtioNetState::default();
+
         // 4. write blob, streaming guest memory page-chunks straight to disk.
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &legacy_state, &regions, |idx, w| {
+        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &legacy_state, &virtio_net_state, &regions, |idx, w| {
             let r = regions[idx];
             let vm_memory = vm_as.memory();
             // Read in 1 MiB chunks so we don't materialize all of guest RAM
@@ -781,6 +790,14 @@ impl Vm {
                     })?;
             }
         }
+
+        // Apply virtio-net device state (v7+, planning-repo audit I-003,
+        // Phase 1). Phase 1 reconciles iface_id ordering and logs drift;
+        // Phase 2 will push live queue cursors back into each `Net`.
+        #[cfg(feature = "virtio-net")]
+        self.device_manager
+            .virtio_net_manager
+            .restore_devices(&reader.virtio_net_state, &self.logger);
 
         // Inject vCPU register state into the (paused) vCPU threads.
         let vcpu_states = std::mem::take(&mut reader.vcpu_states);

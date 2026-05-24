@@ -318,6 +318,78 @@ impl VirtioNetDeviceMgr {
         }
     }
 
+    /// Capture per-device interface spec for snapshot (planning-repo
+    /// audit I-003, Phase 1).
+    ///
+    /// Reads from each device's `VirtioNetDeviceConfigInfo` only —
+    /// queue cursors, ring GPAs, and negotiated features are NOT
+    /// captured yet. Those land in Phase 2 by clone-sharing the
+    /// `QueueSync` Arc from `Net::activate` and reading from a Net
+    /// downcast (the per-device epoll handler privately owns the live
+    /// queues today, so the cursors are not reachable via a `&Net`
+    /// downcast alone).
+    pub fn snapshot_devices(&self) -> crate::snapshot::virtio_net_state::VirtioNetState {
+        let devices = self
+            .info_list
+            .iter()
+            .map(|info| crate::snapshot::virtio_net_state::VirtioNetDeviceState {
+                iface_id: info.config.iface_id.clone(),
+                host_dev_name: info.config.host_dev_name.clone(),
+                guest_mac: info.config.guest_mac.as_ref().map(|m| {
+                    let bytes = m.get_bytes();
+                    let mut out = [0u8; 6];
+                    out.copy_from_slice(&bytes[..6]);
+                    out
+                }),
+                num_queues: info.config.queue_sizes().len() as u8,
+                queue_size: {
+                    let qs = info.config.queue_sizes();
+                    qs.first().copied().unwrap_or(DEFAULT_QUEUE_SIZE)
+                },
+            })
+            .collect();
+        crate::snapshot::virtio_net_state::VirtioNetState { devices }
+    }
+
+    /// Apply a captured virtio-net state envelope on restore (Phase 1).
+    ///
+    /// Phase 1: this is effectively a sanity check — the iface spec in
+    /// the captured envelope is already determined by the VM's
+    /// declarative config and re-applied during device construction.
+    /// We verify the captured set matches what we built and log a
+    /// warning if iface_ids drift; we do not attempt to repair
+    /// mismatches because the substrate-side `Vmm::restore` is
+    /// responsible for boot-with-matching-config. Phase 2 will
+    /// additionally push live queue cursors back into each `Net` via
+    /// the `QueueSync` setters.
+    pub fn restore_devices(
+        &mut self,
+        state: &crate::snapshot::virtio_net_state::VirtioNetState,
+        logger: &slog::Logger,
+    ) {
+        if state.devices.len() != self.info_list.len() {
+            slog::warn!(
+                logger,
+                "virtio-net restore: device count drift";
+                "snapshot" => state.devices.len(),
+                "current" => self.info_list.len(),
+            );
+            return;
+        }
+        for (idx, captured) in state.devices.iter().enumerate() {
+            let cur = &self.info_list[idx].config;
+            if cur.iface_id != captured.iface_id {
+                slog::warn!(
+                    logger,
+                    "virtio-net restore: iface_id drift at index";
+                    "index" => idx,
+                    "snapshot" => &captured.iface_id,
+                    "current" => &cur.iface_id,
+                );
+            }
+        }
+    }
+
     /// Attach all configured net device to the virtual machine instance.
     pub fn attach_devices(
         &mut self,
