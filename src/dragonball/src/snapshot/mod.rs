@@ -114,6 +114,32 @@ impl SnapshotConfig {
 pub struct RestoreConfig {
     /// Filesystem path of the snapshot blob to load.
     pub snapshot_path: PathBuf,
+    /// Path to the parent golden snapshot. Required when
+    /// `snapshot_path` points at a Diff snapshot (audit I-004 Phase 2);
+    /// ignored otherwise. The file is opened, SHA-256-verified against
+    /// the diff header's `parent_sha256`, and used as the source of the
+    /// MAP_FIXED|MAP_PRIVATE base image onto which the diff's dirty
+    /// pages are applied.
+    pub parent_golden_path: Option<PathBuf>,
+}
+
+impl RestoreConfig {
+    /// Construct a restore config for a Golden snapshot.
+    pub fn golden(snapshot_path: PathBuf) -> Self {
+        Self {
+            snapshot_path,
+            parent_golden_path: None,
+        }
+    }
+
+    /// Construct a restore config for a Diff snapshot, pointing at the
+    /// parent Golden snapshot whose memory image is overlaid first.
+    pub fn diff(snapshot_path: PathBuf, parent_golden_path: PathBuf) -> Self {
+        Self {
+            snapshot_path,
+            parent_golden_path: Some(parent_golden_path),
+        }
+    }
 }
 
 /// Errors returned by the snapshot subsystem.

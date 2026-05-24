@@ -714,17 +714,57 @@ impl Vm {
         let mut reader = crate::snapshot::reader::SnapshotReader::open(&cfg.snapshot_path)
             .map_err(VmError::Snapshot)?;
 
-        // Phase 1 of audit I-004 only writes Diff snapshots; the
-        // apply-on-restore path lands in Phase 2.
-        if reader.kind != crate::snapshot::metadata::SnapshotKind::Golden {
-            return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
-                io::Error::other(format!(
-                    "restore_vm: {:?} snapshots are not yet restorable \
-                     (I-004 Phase 1 writes-only)",
-                    reader.kind,
-                )),
-            )));
-        }
+        // For Diff snapshots, open the parent Golden alongside it. The
+        // parent supplies the base memory image (via MAP_FIXED|MAP_PRIVATE);
+        // the diff is overlaid afterwards by writing its dirty pages into
+        // the now-CoW mapping. The parent's SHA-256 is verified against the
+        // diff header's `parent_sha256` so we never apply a diff against
+        // the wrong base image (audit I-004 §4 Q2).
+        let mut parent_reader = match reader.kind {
+            crate::snapshot::metadata::SnapshotKind::Golden => None,
+            crate::snapshot::metadata::SnapshotKind::Diff => {
+                let parent_path = cfg.parent_golden_path.as_ref().ok_or_else(|| {
+                    VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                        "Diff snapshot requires RestoreConfig::parent_golden_path",
+                    )))
+                })?;
+                let parent_hash =
+                    crate::snapshot::hash_file_sha256(parent_path).map_err(|e| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                            format!("hash parent golden snapshot: {e}"),
+                        )))
+                    })?;
+                if parent_hash != reader.parent_sha256 {
+                    return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                        io::Error::other(format!(
+                            "parent SHA-256 mismatch: diff expected {:02x?} but parent file hashed to {:02x?}",
+                            reader.parent_sha256, parent_hash,
+                        )),
+                    )));
+                }
+                let parent_reader =
+                    crate::snapshot::reader::SnapshotReader::open(parent_path)
+                        .map_err(VmError::Snapshot)?;
+                if parent_reader.kind != crate::snapshot::metadata::SnapshotKind::Golden {
+                    return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                        io::Error::other(format!(
+                            "parent snapshot at {} is {:?}; only Golden parents are supported",
+                            parent_path.display(),
+                            parent_reader.kind,
+                        )),
+                    )));
+                }
+                if parent_reader.mem_size_bytes != reader.mem_size_bytes {
+                    return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                        io::Error::other(format!(
+                            "parent mem_size {} != diff mem_size {}",
+                            parent_reader.mem_size_bytes, reader.mem_size_bytes,
+                        )),
+                    )));
+                }
+                Some(parent_reader)
+            }
+        };
 
         // Sanity-check the snapshot matches our current VM shape.
         let mem_size_bytes = (self.vm_config.mem_size_mib as u64) << 20;
@@ -746,19 +786,24 @@ impl Vm {
         }
 
         // Overlay memory pages onto the booted address space using
-        // `mmap(MAP_FIXED | MAP_PRIVATE, snap_fd, file_offset, size)` over
+        // `mmap(MAP_FIXED | MAP_PRIVATE, base_fd, file_offset, size)` over
         // the existing anon-mapped guest memory userspace addresses
         // (I-008a). The KVM_USER_MEMORY_REGION mapping is unchanged; the
         // host VAs stay identical, so KVM keeps serving the same guest
         // physical addresses without any further ioctl. MAP_PRIVATE makes
         // subsequent guest writes COW so the snapshot file is never
         // mutated.
+        //
+        // For Diff snapshots, `base_reader` is the parent Golden — the
+        // dirty pages from the diff are memcpy'd on top of this mapping
+        // after the trailer check.
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let snap_fd = reader.raw_fd();
-        let region_locs = reader.regions_for_mmap();
+        let base_reader = parent_reader.as_ref().unwrap_or(&reader);
+        let snap_fd = base_reader.raw_fd();
+        let region_locs = base_reader.regions_for_mmap();
         for loc in &region_locs {
             let vm_memory = vm_as.memory();
             let region = vm_memory
@@ -823,6 +868,91 @@ impl Vm {
             }
         }
         reader.check_trailer().map_err(VmError::Snapshot)?;
+        if let Some(p) = parent_reader.as_mut() {
+            p.check_trailer().map_err(|e| {
+                VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                    format!("parent golden trailer: {e}"),
+                )))
+            })?;
+        }
+
+        // Apply diff-snapshot dirty pages on top of the (now CoW) parent
+        // mapping. For each region's bitmap, read every set page out of
+        // the diff snapshot via `reader.read_dirty_page` and memcpy it to
+        // `host_addr + page_idx * SNAPSHOT_PAGE_SIZE`. The first write
+        // triggers COW so the parent file is never mutated.
+        if !reader.bitmaps.is_empty() {
+            let page_size = crate::snapshot::metadata::SNAPSHOT_PAGE_SIZE;
+            for (region_idx, loc) in region_locs.iter().enumerate() {
+                let vm_memory = vm_as.memory();
+                let region = vm_memory
+                    .find_region(GuestAddress(loc.guest_phys_addr))
+                    .ok_or_else(|| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                            io::Error::other(format!(
+                                "diff apply: no guest memory region covers gpa 0x{:x}",
+                                loc.guest_phys_addr
+                            )),
+                        ))
+                    })?;
+                let region_offset = loc.guest_phys_addr - region.start_addr().raw_value();
+                let host_base = region
+                    .get_host_address(MemoryRegionAddress(region_offset))
+                    .map_err(|e| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                            io::Error::other(format!("get_host_address failed: {e:?}")),
+                        ))
+                    })?;
+                let bitmap = &reader.bitmaps[region_idx];
+                let num_pages = loc.size.div_ceil(page_size);
+                let mut applied: u64 = 0;
+                for word_idx in 0..bitmap.len() {
+                    let mut word = bitmap[word_idx];
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as u64;
+                        word &= word - 1;
+                        let page_idx = (word_idx as u64) * 64 + bit;
+                        if page_idx >= num_pages {
+                            break;
+                        }
+                        let page_bytes = reader
+                            .read_dirty_page(region_idx, page_idx)
+                            .map_err(VmError::Snapshot)?;
+                        if page_bytes.len() != page_size as usize {
+                            return Err(VmError::Snapshot(
+                                crate::snapshot::SnapshotError::Io(io::Error::other(
+                                    format!(
+                                        "diff apply: read_dirty_page returned {} bytes, expected {}",
+                                        page_bytes.len(),
+                                        page_size,
+                                    ),
+                                )),
+                            ));
+                        }
+                        // SAFETY: `host_base + page_idx * page_size` lies
+                        // inside the MAP_FIXED|MAP_PRIVATE region just
+                        // installed above; both source and destination are
+                        // non-overlapping, properly aligned, and live for
+                        // the duration of the memcpy. Writing here triggers
+                        // CoW so the parent file remains untouched.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                page_bytes.as_ptr(),
+                                host_base.wrapping_add((page_idx * page_size) as usize),
+                                page_size as usize,
+                            );
+                        }
+                        applied += 1;
+                    }
+                }
+                info!(
+                    self.logger,
+                    "VM: diff snapshot applied dirty pages";
+                    "region_idx" => region_idx,
+                    "pages_applied" => applied,
+                );
+            }
+        }
 
         // Apply VM-level KVM state (irqchip, PIT2, clock) BEFORE per-vCPU
         // state so that SET_LAPIC's interrupt routing lands on top of a
