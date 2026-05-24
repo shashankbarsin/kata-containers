@@ -14,7 +14,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use super::metadata::{MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
+use super::metadata::{SnapshotKind, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
 use super::serial_state::LegacyDeviceState;
 use super::vcpu_state::VcpuStateData;
 use super::virtio_net_state::{self, VirtioNetState};
@@ -54,10 +54,15 @@ pub struct SnapshotReader {
     pub path: PathBuf,
     /// `format_version` from the header.
     pub format_version: u32,
+    /// `snapshot_kind` from the v9 header (Golden or Diff).
+    pub kind: SnapshotKind,
     /// Number of vCPU states recorded in this snapshot.
     pub vcpu_count: u8,
     /// Total guest RAM size in bytes.
     pub mem_size_bytes: u64,
+    /// `parent_sha256` from the v9 header. All-zero for Golden;
+    /// SHA-256 of the parent golden file for Diff (audit I-004 §4 Q2).
+    pub parent_sha256: [u8; 32],
     /// Captured vCPU register snapshots (already consumed from the stream).
     pub vcpu_states: Vec<VcpuStateData>,
     /// Captured VM-level architectural state (v4+).
@@ -100,9 +105,35 @@ impl SnapshotReader {
             )));
         }
         let vcpu_count = read_u8(&mut r)?;
-        let _reserved_u8 = read_u8(&mut r)?;
+        let kind_byte = read_u8(&mut r)?;
+        let kind = SnapshotKind::from_u8(kind_byte).ok_or_else(|| {
+            SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown snapshot_kind byte {kind_byte} in v9 header"),
+            ))
+        })?;
         let _reserved_u16 = read_u16(&mut r)?;
         let mem_size_bytes = read_u64(&mut r)?;
+        let mut parent_sha256 = [0u8; 32];
+        r.read_exact(&mut parent_sha256)?;
+        match kind {
+            SnapshotKind::Golden => {
+                if parent_sha256 != [0u8; 32] {
+                    return Err(SnapshotError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Golden snapshot must have all-zero parent_sha256",
+                    )));
+                }
+            }
+            SnapshotKind::Diff => {
+                if parent_sha256 == [0u8; 32] {
+                    return Err(SnapshotError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Diff snapshot must carry a non-zero parent_sha256",
+                    )));
+                }
+            }
+        }
 
         let mut vcpu_states = Vec::with_capacity(vcpu_count as usize);
         for _ in 0..vcpu_count {
@@ -185,17 +216,20 @@ impl SnapshotReader {
             ))
         })?;
 
-        // Seek to the first region's payload — the stream is currently at
-        // the end of the descriptor table; the payload lives at the
-        // page-aligned offset stamped into the descriptor.
+        // Seek to the first region's payload (Golden) or first region's
+        // dirty-bitmap section (Diff). For Diff in Phase 1 the body
+        // after this offset is all zeros and is not yet consumed by
+        // restore; Phase 2 will parse it.
         r.seek(SeekFrom::Start(region_offsets[0]))?;
 
         Ok(SnapshotReader {
             reader: r,
             path: path.to_path_buf(),
             format_version,
+            kind,
             vcpu_count,
             mem_size_bytes,
+            parent_sha256,
             vcpu_states,
             vm_state,
             legacy_state,

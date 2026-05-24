@@ -612,6 +612,7 @@ impl Vm {
             self.logger,
             "VM: snapshot written";
             "path" => cfg.snapshot_path.display().to_string(),
+            "kind" => format!("{:?}", metadata.kind),
             "vcpu_count" => metadata.vcpu_count,
             "mem_size_bytes" => metadata.mem_size_bytes,
             "format_version" => metadata.format_version,
@@ -637,6 +638,18 @@ impl Vm {
     ) -> std::result::Result<(), VmError> {
         let mut reader = crate::snapshot::reader::SnapshotReader::open(&cfg.snapshot_path)
             .map_err(VmError::Snapshot)?;
+
+        // Phase 1 of audit I-004 only writes Diff snapshots; the
+        // apply-on-restore path lands in Phase 2.
+        if reader.kind != crate::snapshot::metadata::SnapshotKind::Golden {
+            return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                io::Error::other(format!(
+                    "restore_vm: {:?} snapshots are not yet restorable \
+                     (I-004 Phase 1 writes-only)",
+                    reader.kind,
+                )),
+            )));
+        }
 
         // Sanity-check the snapshot matches our current VM shape.
         let mem_size_bytes = (self.vm_config.mem_size_mib as u64) << 20;
