@@ -52,7 +52,18 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// right base is being applied. Diffs additionally carry per-region
 /// dirty bitmaps in place of embedded region payloads — see
 /// [`crate::snapshot`] for the full layout.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 9;
+/// Bumped to 10 (I-004 Phase 3.5): header gains a fixed-width
+/// `self_sha256: [u8; 32]` field at offset 56, immediately after
+/// `parent_sha256`. Stamped at write time as SHA-256 over the entire
+/// snapshot file (with the `self_sha256` field itself treated as
+/// 32 zero bytes during the hash). Lets the Diff-restore hot path
+/// verify "right parent" by reading the parent golden's `self_sha256`
+/// field (cheap header parse) instead of re-hashing the whole golden
+/// file on every restore — the mitigation called out in audit I-004 §7
+/// against the original "parent-hash verification adds latency"
+/// finding from Phase 3 measurement (planning-repo
+/// `docs/measurements/I-004-phase3-2026-05-24.csv`).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 10;
 
 /// Page size assumed by the v3 alignment scheme. Matches every architecture
 /// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.
@@ -105,4 +116,12 @@ pub struct SnapshotMetadata {
     /// diff is built against; restore uses this to verify the right
     /// base is being applied (audit I-004 §4 Q2).
     pub parent_sha256: [u8; 32],
+    /// SHA-256 of this snapshot file (v10+). Computed at write time
+    /// over the entire file, with the `self_sha256` field itself
+    /// treated as 32 zero bytes during the hash. Lets a Diff-restore
+    /// hot path verify "right parent" by reading the parent's
+    /// `self_sha256` (cheap) instead of re-hashing the parent file
+    /// (expensive). Phase 3.5 mitigation against the Phase 3 latency
+    /// finding (audit I-004 §7).
+    pub self_sha256: [u8; 32],
 }

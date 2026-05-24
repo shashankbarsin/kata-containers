@@ -717,9 +717,13 @@ impl Vm {
         // For Diff snapshots, open the parent Golden alongside it. The
         // parent supplies the base memory image (via MAP_FIXED|MAP_PRIVATE);
         // the diff is overlaid afterwards by writing its dirty pages into
-        // the now-CoW mapping. The parent's SHA-256 is verified against the
-        // diff header's `parent_sha256` so we never apply a diff against
-        // the wrong base image (audit I-004 §4 Q2).
+        // the now-CoW mapping. The parent's identity is verified by
+        // comparing the parent's stamped `self_sha256` header field
+        // (cheap, fixed-size, populated at write time) against the diff
+        // header's `parent_sha256` — see audit I-004 §4 Q2 and the §7
+        // Phase 3.5 mitigation that replaced re-hashing the parent file
+        // on every restore (~210 ms on a 268 MB golden, from
+        // planning-repo `docs/measurements/I-004-phase3-2026-05-24.csv`).
         let mut parent_reader = match reader.kind {
             crate::snapshot::metadata::SnapshotKind::Golden => None,
             crate::snapshot::metadata::SnapshotKind::Diff => {
@@ -728,23 +732,17 @@ impl Vm {
                         "Diff snapshot requires RestoreConfig::parent_golden_path",
                     )))
                 })?;
-                let parent_hash =
-                    crate::snapshot::hash_file_sha256(parent_path).map_err(|e| {
-                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
-                            format!("hash parent golden snapshot: {e}"),
-                        )))
-                    })?;
-                if parent_hash != reader.parent_sha256 {
-                    return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
-                        io::Error::other(format!(
-                            "parent SHA-256 mismatch: diff expected {:02x?} but parent file hashed to {:02x?}",
-                            reader.parent_sha256, parent_hash,
-                        )),
-                    )));
-                }
                 let parent_reader =
                     crate::snapshot::reader::SnapshotReader::open(parent_path)
                         .map_err(VmError::Snapshot)?;
+                if parent_reader.self_sha256 != reader.parent_sha256 {
+                    return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
+                        io::Error::other(format!(
+                            "parent SHA-256 mismatch: diff expected {:02x?} but parent header self_sha256 is {:02x?}",
+                            reader.parent_sha256, parent_reader.self_sha256,
+                        )),
+                    )));
+                }
                 if parent_reader.kind != crate::snapshot::metadata::SnapshotKind::Golden {
                     return Err(VmError::Snapshot(crate::snapshot::SnapshotError::Io(
                         io::Error::other(format!(

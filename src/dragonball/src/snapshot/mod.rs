@@ -26,7 +26,7 @@ pub mod virtio_net_state;
 pub mod vm_state;
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -184,20 +184,33 @@ pub struct MemoryRegionDescriptor {
 /// `region_payload` is invoked once per region for Golden snapshots and
 /// is ignored for Diff snapshots.
 ///
-/// File layout (all integers little-endian, v9 — adds snapshot-kind
-/// byte at offset 13 and a fixed-width `parent_sha256` at offset 24,
-/// per audit I-004 Phase 1):
+/// File layout (all integers little-endian, v10 — adds `self_sha256`
+/// at offset 56, immediately after `parent_sha256`, per audit I-004
+/// Phase 3.5):
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 9)
+/// [ 8..12] format_version   : u32   (currently 10)
 /// [12..13] vcpu_count       : u8
 /// [13..14] snapshot_kind    : u8    (0 = Golden, 1 = Diff)
 /// [14..16] reserved         : u16   (== 0)
 /// [16..24] mem_size_bytes   : u64   (sum of all region sizes)
 /// [24..56] parent_sha256    : [u8; 32]
 ///                                   (Golden: all zero;
-///                                    Diff:   SHA-256 of parent file)
+///                                    Diff:   SHA-256 of parent file's
+///                                            `self_sha256`-bearing
+///                                            file content)
+/// [56..88] self_sha256      : [u8; 32]
+///                                   (SHA-256 of this file with the
+///                                    `self_sha256` field treated as
+///                                    zero bytes during the hash;
+///                                    patched into the header after
+///                                    the rest of the file is written.
+///                                    Restore from a Diff reads its
+///                                    parent's `self_sha256` to verify
+///                                    "right parent" without re-hashing
+///                                    the whole golden file —
+///                                    audit I-004 §7.)
 /// for each vCPU:
 ///     [1]                vcpu_id          : u8
 ///     [u32 len + bytes]  kvm_regs raw
@@ -336,13 +349,16 @@ fn write_golden_snapshot(
     region_payload: &mut dyn FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
     let mem_size: u64 = regions.iter().map(|r| r.size).sum();
-    let metadata = SnapshotMetadata {
+    let mut metadata = SnapshotMetadata {
         magic: MAGIC,
         format_version: SNAPSHOT_FORMAT_VERSION,
         kind: SnapshotKind::Golden,
         vcpu_count: vcpu_states.len() as u8,
         mem_size_bytes: mem_size,
         parent_sha256: [0u8; 32],
+        // v10: stamped after the file is flushed (see
+        // `finalize_self_sha256` below).
+        self_sha256: [0u8; 32],
     };
 
     // Encode the v7 virtio-net envelope once and reuse the bytes for both
@@ -353,8 +369,8 @@ fn write_golden_snapshot(
     // up-front so we can stamp absolute page-aligned `file_offset`s into the
     // region descriptor table without seeking back later.
     let header_len: u64 = {
-        // Fixed prelude (v9: 56 bytes — 24 of original + 32 parent_sha256).
-        let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8 + 32;
+        // Fixed prelude (v10: 88 bytes — v9's 56 + 32 self_sha256).
+        let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8 + 32 + 32;
         // Per-vCPU records (9 len-prefixed blobs in v5).
         for st in vcpu_states {
             n += 1; // vcpu_id
@@ -399,8 +415,8 @@ fn write_golden_snapshot(
     let file = File::create(&cfg.snapshot_path)?;
     let mut w = BufWriter::new(file);
 
-    // Header (v9).
-    write_v9_common_header(
+    // Header (v10).
+    write_v10_common_header(
         &mut w,
         SnapshotKind::Golden,
         vcpu_states.len() as u8,
@@ -459,6 +475,13 @@ fn write_golden_snapshot(
     // Trailer.
     w.write_all(&MAGIC_TRAILER)?;
     w.flush()?;
+    drop(w);
+
+    // v10: stamp `self_sha256` into the header. The file was written
+    // with a 32-zero placeholder at offset 56; `finalize_self_sha256`
+    // computes SHA-256 over the whole file (zeros included) and
+    // patches the result in place.
+    metadata.self_sha256 = finalize_self_sha256(&cfg.snapshot_path)?;
     Ok(metadata)
 }
 
@@ -518,16 +541,35 @@ fn write_diff_snapshot(
             "Diff snapshot requires SnapshotConfig::parent_golden_path",
         ))
     })?;
-    let parent_sha256 = hash_file_sha256(parent_path)?;
+    // v10: parent identity comes from its stamped `self_sha256` header
+    // field — cheap to read (parses the parent header only) and matches
+    // exactly what restore will compare against. Audit I-004 §7 mitigation
+    // (Phase 3.5): the previous `hash_file_sha256(parent_path)` re-read
+    // the entire 268 MB golden on every diff write.
+    let parent_reader = reader::SnapshotReader::open(parent_path)
+        .map_err(|e| SnapshotError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to open parent golden {}: {e}", parent_path.display()),
+        )))?;
+    if parent_reader.kind != SnapshotKind::Golden {
+        return Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parent_golden_path {} is not a Golden snapshot", parent_path.display()),
+        )));
+    }
+    let parent_sha256 = parent_reader.self_sha256;
+    drop(parent_reader);
 
     let mem_size: u64 = regions.iter().map(|r| r.size).sum();
-    let metadata = SnapshotMetadata {
+    let mut metadata = SnapshotMetadata {
         magic: MAGIC,
         format_version: SNAPSHOT_FORMAT_VERSION,
         kind: SnapshotKind::Diff,
         vcpu_count: vcpu_states.len() as u8,
         mem_size_bytes: mem_size,
         parent_sha256,
+        // v10: stamped after the file is flushed.
+        self_sha256: [0u8; 32],
     };
 
     let virtio_net_bytes = virtio_net_state::encode(virtio_net_state);
@@ -535,7 +577,8 @@ fn write_diff_snapshot(
     // Header length up-front so we can stamp file_offsets for each
     // region's dirty-bitmap section.
     let header_len: u64 = {
-        let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8 + 32;
+        // Fixed prelude (v10: 88 bytes — v9's 56 + 32 self_sha256).
+        let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8 + 32 + 32;
         for st in vcpu_states {
             n += 1;
             n += 4 + st.regs.len() as u64;
@@ -585,7 +628,7 @@ fn write_diff_snapshot(
     let file = File::create(&cfg.snapshot_path)?;
     let mut w = BufWriter::new(file);
 
-    write_v9_common_header(
+    write_v10_common_header(
         &mut w,
         SnapshotKind::Diff,
         vcpu_states.len() as u8,
@@ -683,12 +726,19 @@ fn write_diff_snapshot(
 
     w.write_all(&MAGIC_TRAILER)?;
     w.flush()?;
+    drop(w);
+
+    // v10: stamp `self_sha256` over the whole file (see Golden writer
+    // for rationale).
+    metadata.self_sha256 = finalize_self_sha256(&cfg.snapshot_path)?;
     Ok(metadata)
 }
 
-/// Write the v9 common header (offsets 0..56). Used by both Golden and
-/// Diff writers.
-fn write_v9_common_header<W: Write>(
+/// Write the v10 common header (offsets 0..88). Used by both Golden
+/// and Diff writers. The `self_sha256` field at offsets 56..88 is
+/// written here as 32 zero bytes; callers patch it in place after the
+/// rest of the file is written via [`finalize_self_sha256`].
+fn write_v10_common_header<W: Write>(
     w: &mut W,
     kind: SnapshotKind,
     vcpu_count: u8,
@@ -702,7 +752,39 @@ fn write_v9_common_header<W: Write>(
     w.write_all(&0u16.to_le_bytes())?; // reserved
     w.write_all(&mem_size_bytes.to_le_bytes())?;
     w.write_all(parent_sha256)?;
+    // v10: self_sha256 placeholder; patched by `finalize_self_sha256`
+    // after the rest of the file has been written.
+    w.write_all(&[0u8; 32])?;
     Ok(())
+}
+
+/// v10: SHA-256 the entire snapshot file (with the `self_sha256`
+/// field's 32-zero placeholder still in place) and patch the digest
+/// into the header at offset 56..88. Returns the computed digest so
+/// the writer can stamp it into the returned `SnapshotMetadata`.
+fn finalize_self_sha256(path: &std::path::Path) -> io::Result<[u8; 32]> {
+    // Hash the full file. The OS page cache will have the just-written
+    // bytes hot, so this is much cheaper than a cold-cache read of the
+    // parent during restore (which is the cost Phase 3.5 eliminates).
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    drop(f);
+
+    // Patch the header in place.
+    let mut pf = std::fs::OpenOptions::new().write(true).open(path)?;
+    pf.seek(SeekFrom::Start(56))?;
+    pf.write_all(&digest)?;
+    pf.flush()?;
+    Ok(digest)
 }
 
 #[inline]
@@ -778,7 +860,11 @@ mod tests {
         .expect("golden write");
         assert_eq!(golden_meta.kind, SnapshotKind::Golden);
         assert_eq!(golden_meta.parent_sha256, [0u8; 32]);
-        let expected_parent_hash = hash_file_sha256(&golden_path).unwrap();
+        // v10: the diff's `parent_sha256` is taken from the parent
+        // golden's stamped `self_sha256` header field, not from
+        // re-hashing the parent file (Phase 3.5).
+        let expected_parent_hash = golden_meta.self_sha256;
+        assert_ne!(expected_parent_hash, [0u8; 32], "golden self_sha256 must be stamped");
 
         // Write a Diff snapshot against the golden file with an empty
         // dirty set (zero-filled bitmap, no payload pages).

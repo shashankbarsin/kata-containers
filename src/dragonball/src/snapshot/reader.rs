@@ -64,6 +64,13 @@ pub struct SnapshotReader {
     /// `parent_sha256` from the v9 header. All-zero for Golden;
     /// SHA-256 of the parent golden file for Diff (audit I-004 §4 Q2).
     pub parent_sha256: [u8; 32],
+    /// `self_sha256` from the v10 header. Stamped at write time as
+    /// SHA-256 over the entire snapshot file with this field zeroed
+    /// during the hash. Used by Diff-restore to verify the parent
+    /// golden cheaply (compare `parent.self_sha256` to
+    /// `diff.parent_sha256`) instead of re-hashing the parent file
+    /// (audit I-004 §7 — Phase 3.5 mitigation).
+    pub self_sha256: [u8; 32],
     /// Captured vCPU register snapshots (already consumed from the stream).
     pub vcpu_states: Vec<VcpuStateData>,
     /// Captured VM-level architectural state (v4+).
@@ -129,6 +136,8 @@ impl SnapshotReader {
         let mem_size_bytes = read_u64(&mut r)?;
         let mut parent_sha256 = [0u8; 32];
         r.read_exact(&mut parent_sha256)?;
+        let mut self_sha256 = [0u8; 32];
+        r.read_exact(&mut self_sha256)?;
         match kind {
             SnapshotKind::Golden => {
                 if parent_sha256 != [0u8; 32] {
@@ -278,6 +287,7 @@ impl SnapshotReader {
             vcpu_count,
             mem_size_bytes,
             parent_sha256,
+            self_sha256,
             vcpu_states,
             vm_state,
             legacy_state,
