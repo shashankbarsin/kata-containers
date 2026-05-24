@@ -21,7 +21,7 @@ use linux_loader::loader::{KernelLoader, KernelLoaderResult};
 use seccompiler::BpfProgram;
 use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
-use slog::{error, info};
+use slog::{error, info, warn};
 use vm_memory::{Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -881,7 +881,20 @@ impl Vm {
         // the diff snapshot via `reader.read_dirty_page` and memcpy it to
         // `host_addr + page_idx * SNAPSHOT_PAGE_SIZE`. The first write
         // triggers COW so the parent file is never mutated.
-        if !reader.bitmaps.is_empty() {
+        // Test-only negative control: when `ATEOM_NEG_SKIP_DIFF_APPLY` is
+        // set in the host environment, skip the diff-overlay memcpy loop.
+        // The VM's memory will then be the parent golden image only,
+        // which lets integration tests assert that the diff-apply step
+        // is what makes a "WRITE before diff snapshot / READ after
+        // restore" test pass. See planning-repo audit I-004 Phase 2e.
+        let skip_diff_apply = std::env::var_os("ATEOM_NEG_SKIP_DIFF_APPLY").is_some();
+        if skip_diff_apply && !reader.bitmaps.is_empty() {
+            warn!(
+                self.logger,
+                "VM: ATEOM_NEG_SKIP_DIFF_APPLY set — skipping diff-overlay (negative-control)"
+            );
+        }
+        if !skip_diff_apply && !reader.bitmaps.is_empty() {
             let page_size = crate::snapshot::metadata::SNAPSHOT_PAGE_SIZE;
             for (region_idx, loc) in region_locs.iter().enumerate() {
                 let vm_memory = vm_as.memory();
