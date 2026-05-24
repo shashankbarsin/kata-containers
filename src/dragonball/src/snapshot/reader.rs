@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use super::metadata::{MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
 use super::serial_state::LegacyDeviceState;
 use super::vcpu_state::VcpuStateData;
+use super::virtio_net_state::{self, VirtioNetState};
 use super::vm_state::VmStateData;
 use super::{MemoryRegionDescriptor, SnapshotError};
 
@@ -63,6 +64,8 @@ pub struct SnapshotReader {
     pub vm_state: VmStateData,
     /// Captured legacy-device state (v6+).
     pub legacy_state: LegacyDeviceState,
+    /// Captured virtio-net device state envelope (v7+).
+    pub virtio_net_state: VirtioNetState,
     /// Memory region descriptor table — guest addr + size only.
     pub regions: Vec<MemoryRegionDescriptor>,
     /// Per-region absolute file offsets (parallel to `regions`).
@@ -173,6 +176,15 @@ impl SnapshotReader {
         let com2 = read_len_prefixed(&mut r)?;
         let legacy_state = LegacyDeviceState { com1, com2 };
 
+        // Virtio-net device state envelope (v7).
+        let virtio_net_bytes = read_len_prefixed(&mut r)?;
+        let virtio_net_state = virtio_net_state::decode(&virtio_net_bytes).map_err(|e| {
+            SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("virtio-net state decode: {e}"),
+            ))
+        })?;
+
         // Seek to the first region's payload — the stream is currently at
         // the end of the descriptor table; the payload lives at the
         // page-aligned offset stamped into the descriptor.
@@ -187,6 +199,7 @@ impl SnapshotReader {
             vcpu_states,
             vm_state,
             legacy_state,
+            virtio_net_state,
             regions,
             region_offsets,
             region_index: 0,

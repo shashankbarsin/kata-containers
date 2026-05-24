@@ -22,6 +22,7 @@ pub mod metadata;
 pub mod reader;
 pub mod serial_state;
 pub mod vcpu_state;
+pub mod virtio_net_state;
 pub mod vm_state;
 
 use std::fs::File;
@@ -33,6 +34,7 @@ use self::metadata::{
 };
 use self::serial_state::LegacyDeviceState;
 use self::vcpu_state::VcpuStateData;
+use self::virtio_net_state::VirtioNetState;
 use self::vm_state::VmStateData;
 
 /// Configuration passed to [`VmmAction::SnapshotVm`](crate::api::v1::VmmAction).
@@ -118,6 +120,9 @@ pub struct MemoryRegionDescriptor {
 /// Legacy-device state (v6):
 ///     [u32 len + bytes]  encoded COM1 SerialState (see serial_state.rs)
 ///     [u32 len + bytes]  encoded COM2 SerialState
+/// Virtio-net device state (v7):
+///     [u32 len + bytes]  encoded VirtioNetState envelope
+///                        (see virtio_net_state.rs)
 /// <padding to next 4 KiB boundary>
 /// for each region (in declaration order):
 ///     <size bytes at file_offset>
@@ -129,6 +134,7 @@ pub fn write_snapshot(
     vcpu_states: &[VcpuStateData],
     vm_state: &VmStateData,
     legacy_state: &LegacyDeviceState,
+    virtio_net_state: &VirtioNetState,
     regions: &[MemoryRegionDescriptor],
     mut region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
@@ -139,6 +145,10 @@ pub fn write_snapshot(
         vcpu_count: vcpu_states.len() as u8,
         mem_size_bytes: mem_size,
     };
+
+    // Encode the v7 virtio-net envelope once and reuse the bytes for both
+    // header sizing and the write.
+    let virtio_net_bytes = virtio_net_state::encode(virtio_net_state);
 
     // Compute the on-disk size of the header (everything before payloads)
     // up-front so we can stamp absolute page-aligned `file_offset`s into the
@@ -170,6 +180,9 @@ pub fn write_snapshot(
         // Legacy-device state: 2 len-prefixed blobs (v6).
         n += 4 + legacy_state.com1.len() as u64;
         n += 4 + legacy_state.com2.len() as u64;
+        // Virtio-net device state envelope (v7): single len-prefixed blob.
+        let virtio_net_bytes_len = virtio_net_bytes.len() as u64;
+        n += 4 + virtio_net_bytes_len;
         n
     };
     let payloads_start = align_up(header_len, SNAPSHOT_PAGE_SIZE);
@@ -228,6 +241,9 @@ pub fn write_snapshot(
     write_len_prefixed(&mut w, &legacy_state.com1)?;
     write_len_prefixed(&mut w, &legacy_state.com2)?;
 
+    // Virtio-net device state envelope (v7). Encoded once above for header
+    // sizing; reuse the bytes here.
+    write_len_prefixed(&mut w, &virtio_net_bytes)?;
     // Pad header out to the first payload's 4 KiB boundary.
     write_zero_pad(&mut w, header_pad)?;
 
