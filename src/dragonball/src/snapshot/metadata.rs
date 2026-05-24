@@ -26,7 +26,7 @@ pub const MAGIC_TRAILER: [u8; 4] = *b"END!";
 /// (PIC master/slave, IOAPIC, PIT2, KVM_CLOCK) is written between the
 /// region descriptor table and the header padding. This is the minimum
 /// state needed for a no-boot mmap restore.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// Page size assumed by the v3 alignment scheme. Matches every architecture
 /// we target (x86_64, aarch64) for `KVM_USER_MEMORY_REGION`.
