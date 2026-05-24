@@ -109,6 +109,7 @@ impl SnapshotReader {
             let xsave = read_len_prefixed(&mut r)?;
             let vcpu_events = read_len_prefixed(&mut r)?;
             let mp_state = read_len_prefixed(&mut r)?;
+            let xcrs = read_len_prefixed(&mut r)?;
             vcpu_states.push(VcpuStateData {
                 vcpu_id,
                 regs,
@@ -119,6 +120,7 @@ impl SnapshotReader {
                 xsave,
                 vcpu_events,
                 mp_state,
+                xcrs,
             });
         }
 

@@ -16,7 +16,7 @@
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     kvm_cpuid_entry2, kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_regs, kvm_sregs,
-    kvm_vcpu_events, kvm_xsave, CpuId, Msrs,
+    kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, Msrs,
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuFd;
@@ -46,6 +46,9 @@ pub struct VcpuStateData {
     pub vcpu_events: Vec<u8>,
     /// Raw `kvm_mp_state` bytes (vCPU run state machine).
     pub mp_state: Vec<u8>,
+    /// Raw `kvm_xcrs` bytes (XCR0 / extended control regs — required for
+    /// AVX/AVX-512 guests so XSAVE-managed feature bits survive restore).
+    pub xcrs: Vec<u8>,
 }
 
 /// Errors raised while capturing per-vCPU state.
@@ -96,6 +99,7 @@ pub fn capture(
     let xsave: kvm_xsave = fd.get_xsave()?;
     let vcpu_events: kvm_vcpu_events = fd.get_vcpu_events()?;
     let mp_state: kvm_mp_state = fd.get_mp_state()?;
+    let xcrs: kvm_xcrs = fd.get_xcrs()?;
 
     Ok(VcpuStateData {
         vcpu_id,
@@ -107,6 +111,7 @@ pub fn capture(
         xsave: any_struct_to_bytes(&xsave),
         vcpu_events: struct_to_bytes(&vcpu_events),
         mp_state: struct_to_bytes(&mp_state),
+        xcrs: struct_to_bytes(&xcrs),
     })
 }
 
@@ -243,6 +248,17 @@ pub fn apply(fd: &VcpuFd, state: &VcpuStateData) -> Result<(), VcpuStateError> {
     }
     let sregs: kvm_sregs = unsafe { std::ptr::read(state.sregs.as_ptr() as *const kvm_sregs) };
     fd.set_sregs(&sregs)?;
+
+    // 6a. XCRS — must come before XSAVE so the XSAVE feature bitmap
+    //     applied by KVM_SET_XSAVE is consistent with XCR0. Restoring
+    //     XSAVE without XCR0 leaves the guest believing AVX (et al.) is
+    //     usable while XCR0 is reset to the x87+SSE default, producing
+    //     spurious faults on the next AVX-encoded instruction.
+    if state.xcrs.len() == size_of::<kvm_xcrs>() {
+        let xcrs: kvm_xcrs =
+            unsafe { std::ptr::read(state.xcrs.as_ptr() as *const kvm_xcrs) };
+        fd.set_xcrs(&xcrs)?;
+    }
 
     // 6. XSAVE.
     if state.xsave.len() == size_of::<kvm_xsave>() {

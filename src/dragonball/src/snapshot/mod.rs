@@ -82,11 +82,11 @@ pub struct MemoryRegionDescriptor {
 
 /// Write a snapshot blob to `cfg.snapshot_path`.
 ///
-/// File layout (all integers little-endian, v4 — I-008b extends v3):
+/// File layout (all integers little-endian, v5 — adds per-vCPU XCRS):
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 4)
+/// [ 8..12] format_version   : u32   (currently 5)
 /// [12..13] vcpu_count       : u8
 /// [13..14] reserved         : u8    (== 0)
 /// [14..16] reserved         : u16   (== 0)
@@ -101,6 +101,7 @@ pub struct MemoryRegionDescriptor {
 ///     [u32 len + bytes]  kvm_xsave raw             (v4)
 ///     [u32 len + bytes]  kvm_vcpu_events raw       (v4)
 ///     [u32 len + bytes]  kvm_mp_state raw          (v4)
+///     [u32 len + bytes]  kvm_xcrs raw              (v5)
 /// [u32] memory_region_count
 /// for each region:
 ///     [u64] guest_phys_addr
@@ -139,7 +140,7 @@ pub fn write_snapshot(
     let header_len: u64 = {
         // Fixed prelude.
         let mut n: u64 = 8 + 4 + 1 + 1 + 2 + 8;
-        // Per-vCPU records (8 len-prefixed blobs in v4).
+        // Per-vCPU records (9 len-prefixed blobs in v5).
         for st in vcpu_states {
             n += 1; // vcpu_id
             n += 4 + st.regs.len() as u64;
@@ -150,6 +151,7 @@ pub fn write_snapshot(
             n += 4 + st.xsave.len() as u64;
             n += 4 + st.vcpu_events.len() as u64;
             n += 4 + st.mp_state.len() as u64;
+            n += 4 + st.xcrs.len() as u64;
         }
         // Region descriptor table: u32 count + (u64+u64+u64) per region.
         n += 4 + (regions.len() as u64) * 24;
@@ -184,7 +186,7 @@ pub fn write_snapshot(
     w.write_all(&0u16.to_le_bytes())?; // reserved
     w.write_all(&metadata.mem_size_bytes.to_le_bytes())?;
 
-    // Per-vCPU state (8 len-prefixed blobs in v4).
+    // Per-vCPU state (9 len-prefixed blobs in v5).
     for state in vcpu_states {
         w.write_all(&[state.vcpu_id])?;
         write_len_prefixed(&mut w, &state.regs)?;
@@ -195,6 +197,7 @@ pub fn write_snapshot(
         write_len_prefixed(&mut w, &state.xsave)?;
         write_len_prefixed(&mut w, &state.vcpu_events)?;
         write_len_prefixed(&mut w, &state.mp_state)?;
+        write_len_prefixed(&mut w, &state.xcrs)?;
     }
 
     // Memory region descriptor table.
