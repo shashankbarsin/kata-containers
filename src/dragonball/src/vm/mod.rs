@@ -562,12 +562,26 @@ impl Vm {
             )))
         })?;
 
+        // 3c. Legacy-device state (COM1 / COM2 8250-UART). Empty blobs if
+        //     the device manager has no legacy_manager (shouldn't happen on
+        //     x86_64 boot paths). See snapshot/serial_state.rs.
+        let legacy_state = {
+            let mut s = crate::snapshot::serial_state::LegacyDeviceState::default();
+            if let Some(lm) = self.device_manager.legacy_manager.as_ref() {
+                let com1_state = lm.get_com1_serial().lock().unwrap().state();
+                let com2_state = lm.get_com2_serial().lock().unwrap().state();
+                s.com1 = crate::snapshot::serial_state::encode_serial_state(&com1_state);
+                s.com2 = crate::snapshot::serial_state::encode_serial_state(&com2_state);
+            }
+            s
+        };
+
         // 4. write blob, streaming guest memory page-chunks straight to disk.
         let vm_as = self
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &regions, |idx, w| {
+        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &legacy_state, &regions, |idx, w| {
             let r = regions[idx];
             let vm_memory = vm_as.memory();
             // Read in 1 MiB chunks so we don't materialize all of guest RAM
@@ -722,6 +736,51 @@ impl Vm {
                 format!("vm-state apply: {e}"),
             )))
         })?;
+
+        // Apply legacy-device state (v6+). Re-creates the inner vm_superio
+        // `Serial` of each COM device from the captured register/FIFO
+        // state so that post-restore IER honours the guest-configured RDA
+        // interrupt mask. Without this, host→guest `raw_input` enqueues
+        // bytes in the RX FIFO but the COM IRQ never fires and the guest
+        // UART driver stays blocked in `read()`.
+        if let Some(lm) = self.device_manager.legacy_manager.as_ref() {
+            if let Some(com1) = crate::snapshot::serial_state::decode_serial_state(
+                &reader.legacy_state.com1,
+            )
+            .map_err(|e| {
+                VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                    format!("decode com1 serial state: {e}"),
+                )))
+            })? {
+                lm.get_com1_serial()
+                    .lock()
+                    .unwrap()
+                    .apply_state(&com1)
+                    .map_err(|e| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                            format!("apply com1 serial state: {e}"),
+                        )))
+                    })?;
+            }
+            if let Some(com2) = crate::snapshot::serial_state::decode_serial_state(
+                &reader.legacy_state.com2,
+            )
+            .map_err(|e| {
+                VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                    format!("decode com2 serial state: {e}"),
+                )))
+            })? {
+                lm.get_com2_serial()
+                    .lock()
+                    .unwrap()
+                    .apply_state(&com2)
+                    .map_err(|e| {
+                        VmError::Snapshot(crate::snapshot::SnapshotError::Io(io::Error::other(
+                            format!("apply com2 serial state: {e}"),
+                        )))
+                    })?;
+            }
+        }
 
         // Inject vCPU register state into the (paused) vCPU threads.
         let vcpu_states = std::mem::take(&mut reader.vcpu_states);

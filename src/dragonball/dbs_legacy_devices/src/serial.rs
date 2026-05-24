@@ -17,6 +17,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::EventFdTrigger;
 
+/// Re-export so external callers (e.g. dragonball's snapshot module) can
+/// reference the wire-state type without pulling in vm_superio directly.
+pub use vm_superio::serial::SerialState;
+
 /// Trait for devices that handle raw non-blocking I/O requests.
 pub trait ConsoleHandler {
     /// Send raw input to this emulated device.
@@ -96,6 +100,39 @@ impl SerialDevice {
 
     pub fn metrics(&mut self) -> Arc<SerialDeviceMetrics> {
         self.serial.events().metrics.clone()
+    }
+
+    /// Snapshot the inner vm_superio `Serial` register/FIFO state.
+    pub fn state(&self) -> SerialState {
+        self.serial.state()
+    }
+
+    /// Re-create the inner vm_superio `Serial` from a previously captured
+    /// state, preserving the wrapper's `out` sink, the same eventfd-backed
+    /// IRQ trigger (`dup`'d so KVM's `register_irqfd` registration is still
+    /// honoured), and the same metrics handle.
+    ///
+    /// This is the snapshot-restore counterpart to [`Self::new`]. After
+    /// `apply_state`, the post-restore device honours IER (so host-side
+    /// `raw_input` will assert COM1 IRQ if the guest had RDA interrupts
+    /// enabled at snapshot time), LCR / FCR / MCR / SCR, and the queued
+    /// RX FIFO bytes.
+    pub fn apply_state(&mut self, state: &SerialState) -> std::io::Result<()> {
+        let trigger = self.serial.interrupt_evt().try_clone()?;
+        let metrics = self.serial.events().metrics.clone();
+        let buffer_ready = match self.serial.events().buffer_ready_event_fd.as_ref() {
+            Some(t) => Some(t.try_clone()?),
+            None => None,
+        };
+        let events = SerialEventsWrapper {
+            metrics,
+            buffer_ready_event_fd: buffer_ready,
+        };
+        let writer = AdapterWriter(self.out.clone());
+        let serial = Serial::from_state(state, trigger, events, writer)
+            .map_err(|e| std::io::Error::other(format!("Serial::from_state: {e:?}")))?;
+        self.serial = serial;
+        Ok(())
     }
 }
 

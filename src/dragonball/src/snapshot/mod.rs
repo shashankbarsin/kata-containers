@@ -20,6 +20,7 @@
 pub mod kvm_dirty_tracker;
 pub mod metadata;
 pub mod reader;
+pub mod serial_state;
 pub mod vcpu_state;
 pub mod vm_state;
 
@@ -30,6 +31,7 @@ use std::path::PathBuf;
 use self::metadata::{
     SnapshotMetadata, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_PAGE_SIZE,
 };
+use self::serial_state::LegacyDeviceState;
 use self::vcpu_state::VcpuStateData;
 use self::vm_state::VmStateData;
 
@@ -82,11 +84,11 @@ pub struct MemoryRegionDescriptor {
 
 /// Write a snapshot blob to `cfg.snapshot_path`.
 ///
-/// File layout (all integers little-endian, v5 — adds per-vCPU XCRS):
+/// File layout (all integers little-endian, v6 — adds legacy COM1/COM2 state):
 ///
 /// ```text
 /// [ 0.. 8] magic            : "ATEOMSN1"
-/// [ 8..12] format_version   : u32   (currently 5)
+/// [ 8..12] format_version   : u32   (currently 6)
 /// [12..13] vcpu_count       : u8
 /// [13..14] reserved         : u8    (== 0)
 /// [14..16] reserved         : u16   (== 0)
@@ -113,6 +115,9 @@ pub struct MemoryRegionDescriptor {
 ///     [u32 len + bytes]  kvm_irqchip (IOAPIC)
 ///     [u32 len + bytes]  kvm_pit_state2
 ///     [u32 len + bytes]  kvm_clock_data
+/// Legacy-device state (v6):
+///     [u32 len + bytes]  encoded COM1 SerialState (see serial_state.rs)
+///     [u32 len + bytes]  encoded COM2 SerialState
 /// <padding to next 4 KiB boundary>
 /// for each region (in declaration order):
 ///     <size bytes at file_offset>
@@ -123,6 +128,7 @@ pub fn write_snapshot(
     cfg: &SnapshotConfig,
     vcpu_states: &[VcpuStateData],
     vm_state: &VmStateData,
+    legacy_state: &LegacyDeviceState,
     regions: &[MemoryRegionDescriptor],
     mut region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
@@ -161,6 +167,9 @@ pub fn write_snapshot(
         n += 4 + vm_state.ioapic.len() as u64;
         n += 4 + vm_state.pit2.len() as u64;
         n += 4 + vm_state.clock.len() as u64;
+        // Legacy-device state: 2 len-prefixed blobs (v6).
+        n += 4 + legacy_state.com1.len() as u64;
+        n += 4 + legacy_state.com2.len() as u64;
         n
     };
     let payloads_start = align_up(header_len, SNAPSHOT_PAGE_SIZE);
@@ -214,6 +223,10 @@ pub fn write_snapshot(
     write_len_prefixed(&mut w, &vm_state.ioapic)?;
     write_len_prefixed(&mut w, &vm_state.pit2)?;
     write_len_prefixed(&mut w, &vm_state.clock)?;
+
+    // Legacy-device state block (v6).
+    write_len_prefixed(&mut w, &legacy_state.com1)?;
+    write_len_prefixed(&mut w, &legacy_state.com2)?;
 
     // Pad header out to the first payload's 4 KiB boundary.
     write_zero_pad(&mut w, header_pad)?;

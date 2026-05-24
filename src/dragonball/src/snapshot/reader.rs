@@ -15,6 +15,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use super::metadata::{MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
+use super::serial_state::LegacyDeviceState;
 use super::vcpu_state::VcpuStateData;
 use super::vm_state::VmStateData;
 use super::{MemoryRegionDescriptor, SnapshotError};
@@ -60,6 +61,8 @@ pub struct SnapshotReader {
     pub vcpu_states: Vec<VcpuStateData>,
     /// Captured VM-level architectural state (v4+).
     pub vm_state: VmStateData,
+    /// Captured legacy-device state (v6+).
+    pub legacy_state: LegacyDeviceState,
     /// Memory region descriptor table — guest addr + size only.
     pub regions: Vec<MemoryRegionDescriptor>,
     /// Per-region absolute file offsets (parallel to `regions`).
@@ -165,6 +168,11 @@ impl SnapshotReader {
             clock,
         };
 
+        // Legacy-device state block (v6).
+        let com1 = read_len_prefixed(&mut r)?;
+        let com2 = read_len_prefixed(&mut r)?;
+        let legacy_state = LegacyDeviceState { com1, com2 };
+
         // Seek to the first region's payload — the stream is currently at
         // the end of the descriptor table; the payload lives at the
         // page-aligned offset stamped into the descriptor.
@@ -178,6 +186,7 @@ impl SnapshotReader {
             mem_size_bytes,
             vcpu_states,
             vm_state,
+            legacy_state,
             regions,
             region_offsets,
             region_index: 0,
