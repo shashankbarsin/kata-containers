@@ -590,7 +590,7 @@ impl Vm {
             .vm_as()
             .cloned()
             .ok_or(VmError::SnapshotKvm(kvm_ioctls::Error::new(libc::EINVAL)))?;
-        let metadata = crate::snapshot::write_snapshot(cfg, &vcpu_states, &vm_state, &legacy_state, &virtio_net_state, &regions, |idx, w| {
+        let mut golden_source = |idx: usize, w: &mut dyn std::io::Write| -> std::io::Result<()> {
             let r = regions[idx];
             let vm_memory = vm_as.memory();
             // Read in 1 MiB chunks so we don't materialize all of guest RAM
@@ -606,7 +606,16 @@ impl Vm {
                 offset += take as u64;
             }
             Ok(())
-        })
+        };
+        let metadata = crate::snapshot::write_snapshot(
+            cfg,
+            &vcpu_states,
+            &vm_state,
+            &legacy_state,
+            &virtio_net_state,
+            &regions,
+            crate::snapshot::SnapshotSource::Golden(&mut golden_source),
+        )
         .map_err(VmError::Snapshot)?;
         info!(
             self.logger,

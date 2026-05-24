@@ -12,14 +12,15 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use super::metadata::{SnapshotKind, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION};
+use super::metadata::{SnapshotKind, MAGIC, MAGIC_TRAILER, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_PAGE_SIZE};
 use super::serial_state::LegacyDeviceState;
 use super::vcpu_state::VcpuStateData;
 use super::virtio_net_state::{self, VirtioNetState};
 use super::vm_state::VmStateData;
-use super::{MemoryRegionDescriptor, SnapshotError};
+use super::{dirty_bitmap_bytes_for_region, MemoryRegionDescriptor, SnapshotError};
 
 /// Descriptor enriched with the absolute file offset where the region's
 /// payload lives. Used by the mmap restore fast path.
@@ -74,7 +75,19 @@ pub struct SnapshotReader {
     /// Memory region descriptor table — guest addr + size only.
     pub regions: Vec<MemoryRegionDescriptor>,
     /// Per-region absolute file offsets (parallel to `regions`).
+    /// Golden: offset of the full region payload.
+    /// Diff: offset of the per-region dirty-page bitmap section.
     pub region_offsets: Vec<u64>,
+    /// Per-region dirty-page bitmaps (Diff only; empty for Golden).
+    /// Bit `p` set ⇒ page `p` (4 KiB) of that region is dirty and its
+    /// 4 KiB payload lives in the payload section that follows the
+    /// bitmap on disk.
+    pub bitmaps: Vec<Vec<u64>>,
+    /// Per-region absolute file offsets of the dirty-page **payload**
+    /// section (parallel to `regions`). Diff only; empty for Golden.
+    /// Each payload is 4 KiB; the i-th 4 KiB block holds the i-th
+    /// dirty page in scan order over `bitmaps[region_idx]`.
+    pub payload_offsets: Vec<u64>,
     /// Index of next region to stream via [`Self::read_next_region`].
     region_index: usize,
 }
@@ -217,9 +230,44 @@ impl SnapshotReader {
         })?;
 
         // Seek to the first region's payload (Golden) or first region's
-        // dirty-bitmap section (Diff). For Diff in Phase 1 the body
-        // after this offset is all zeros and is not yet consumed by
-        // restore; Phase 2 will parse it.
+        // dirty-bitmap section (Diff). For Diff, also parse all
+        // per-region bitmaps now and record where each region's payload
+        // section starts.
+        let (bitmaps, payload_offsets) = match kind {
+            SnapshotKind::Golden => (Vec::new(), Vec::new()),
+            SnapshotKind::Diff => {
+                let mut bms: Vec<Vec<u64>> = Vec::with_capacity(regions.len());
+                let mut payloads: Vec<u64> = Vec::with_capacity(regions.len());
+                for (i, region) in regions.iter().enumerate() {
+                    let bmp_bytes = dirty_bitmap_bytes_for_region(region.size);
+                    let bmp_words = (bmp_bytes / 8) as usize;
+                    r.seek(SeekFrom::Start(region_offsets[i]))?;
+                    let mut words = Vec::with_capacity(bmp_words);
+                    for _ in 0..bmp_words {
+                        words.push(read_u64(&mut r)?);
+                    }
+                    // Mask any tail bits past the region's true page count
+                    // (defensive — kernel should already have done this).
+                    let num_pages = region.size.div_ceil(SNAPSHOT_PAGE_SIZE);
+                    let tail_word = (num_pages / 64) as usize;
+                    let tail_bits = (num_pages % 64) as u32;
+                    if tail_word < words.len() && tail_bits != 0 {
+                        let mask = (1u64 << tail_bits) - 1;
+                        words[tail_word] &= mask;
+                    }
+                    for w in words.iter_mut().skip(tail_word + 1) {
+                        *w = 0;
+                    }
+                    // Payload section starts after the bitmap padded to
+                    // the next 4 KiB boundary.
+                    let payload_off =
+                        region_offsets[i] + align_up(bmp_bytes, SNAPSHOT_PAGE_SIZE);
+                    payloads.push(payload_off);
+                    bms.push(words);
+                }
+                (bms, payloads)
+            }
+        };
         r.seek(SeekFrom::Start(region_offsets[0]))?;
 
         Ok(SnapshotReader {
@@ -236,6 +284,8 @@ impl SnapshotReader {
             virtio_net_state,
             regions,
             region_offsets,
+            bitmaps,
+            payload_offsets,
             region_index: 0,
         })
     }
@@ -316,6 +366,67 @@ impl SnapshotReader {
         }
         Ok(())
     }
+
+    /// Read one dirty page out of a Diff snapshot by
+    /// `(region_idx, page_idx_in_region)`. Returns
+    /// `InvalidInput` if the snapshot is Golden, or if the requested
+    /// page's bit is not set in `bitmaps[region_idx]`.
+    ///
+    /// Implementation: counts the number of set bits below
+    /// `page_idx_in_region` to get the page's ordinal in the payload
+    /// section, then `pread`s 4 KiB from
+    /// `payload_offsets[region_idx] + ordinal * 4096`.
+    pub fn read_dirty_page(
+        &self,
+        region_idx: usize,
+        page_idx_in_region: u64,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        if self.kind != SnapshotKind::Diff {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_dirty_page called on non-Diff snapshot",
+            )));
+        }
+        if region_idx >= self.regions.len() {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "region_idx {region_idx} out of range (have {})",
+                    self.regions.len()
+                ),
+            )));
+        }
+        let bitmap = &self.bitmaps[region_idx];
+        let word_idx = (page_idx_in_region / 64) as usize;
+        let bit = page_idx_in_region % 64;
+        if word_idx >= bitmap.len() || bitmap[word_idx] & (1u64 << bit) == 0 {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "page {page_idx_in_region} of region {region_idx} is not dirty",
+                ),
+            )));
+        }
+        // Count set bits in all words below word_idx, plus set bits in
+        // this word below `bit`.
+        let mut ordinal: u64 = 0;
+        for w in &bitmap[..word_idx] {
+            ordinal += w.count_ones() as u64;
+        }
+        let below_mask = (1u64 << bit) - 1;
+        ordinal += (bitmap[word_idx] & below_mask).count_ones() as u64;
+
+        let offset = self.payload_offsets[region_idx] + ordinal * SNAPSHOT_PAGE_SIZE;
+        let mut buf = vec![0u8; SNAPSHOT_PAGE_SIZE as usize];
+        self.reader.get_ref().read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+}
+
+#[inline]
+fn align_up(value: u64, alignment: u64) -> u64 {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
 }
 
 fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {

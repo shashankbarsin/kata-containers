@@ -40,6 +40,33 @@ use self::vcpu_state::VcpuStateData;
 use self::virtio_net_state::VirtioNetState;
 use self::vm_state::VmStateData;
 
+/// Source of memory contents for the snapshot writer (audit I-004 Phase 2).
+///
+/// * `Golden` — caller provides a per-region payload writer that streams
+///   the full region contents (one closure invocation per region,
+///   sequential).
+/// * `Diff` — caller provides one KVM-format dirty-page bitmap per
+///   region (as returned by `KVM_GET_DIRTY_LOG`) plus a callback that
+///   reads a single 4 KiB page from the guest by
+///   `(region_idx, page_idx_in_region)`. The writer emits, per region,
+///   the bitmap (page-aligned) followed by the concatenated dirty-page
+///   payloads in increasing-page-index scan order.
+pub enum SnapshotSource<'a> {
+    /// Golden snapshot: streams full region contents.
+    Golden(&'a mut dyn FnMut(usize, &mut dyn Write) -> io::Result<()>),
+    /// Diff snapshot: per-region dirty bitmap + per-dirty-page reader.
+    Diff {
+        /// One bitmap per region, parallel to `regions`. Bit `p` set ⇒
+        /// page `p` (4 KiB) of that region is dirty and its 4 KiB
+        /// payload follows the bitmap on disk.
+        bitmaps: &'a [Vec<u64>],
+        /// Reads one dirty page out of the guest by
+        /// `(region_idx, page_idx_in_region)`. Must return exactly
+        /// 4096 bytes.
+        read_page: &'a mut dyn FnMut(usize, u64) -> io::Result<Vec<u8>>,
+    },
+}
+
 /// Configuration passed to [`VmmAction::SnapshotVm`](crate::api::v1::VmmAction).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotConfig {
@@ -183,10 +210,10 @@ pub fn write_snapshot(
     legacy_state: &LegacyDeviceState,
     virtio_net_state: &VirtioNetState,
     regions: &[MemoryRegionDescriptor],
-    region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
+    source: SnapshotSource<'_>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
-    match cfg.kind {
-        SnapshotKind::Golden => write_golden_snapshot(
+    match (cfg.kind, source) {
+        (SnapshotKind::Golden, SnapshotSource::Golden(region_payload)) => write_golden_snapshot(
             cfg,
             vcpu_states,
             vm_state,
@@ -195,14 +222,28 @@ pub fn write_snapshot(
             regions,
             region_payload,
         ),
-        SnapshotKind::Diff => write_diff_snapshot_phase1(
+        (SnapshotKind::Diff, SnapshotSource::Diff { bitmaps, read_page }) => write_diff_snapshot(
             cfg,
             vcpu_states,
             vm_state,
             legacy_state,
             virtio_net_state,
             regions,
+            bitmaps,
+            read_page,
         ),
+        (SnapshotKind::Golden, SnapshotSource::Diff { .. }) => Err(SnapshotError::Io(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SnapshotConfig::kind=Golden requires SnapshotSource::Golden",
+            ),
+        )),
+        (SnapshotKind::Diff, SnapshotSource::Golden(_)) => Err(SnapshotError::Io(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SnapshotConfig::kind=Diff requires SnapshotSource::Diff",
+            ),
+        )),
     }
 }
 
@@ -235,6 +276,26 @@ fn dirty_bitmap_bytes_for_region(region_size: u64) -> u64 {
     num_words * 8
 }
 
+/// Count set bits in `bitmap`, ignoring any tail bits past `num_pages`.
+/// Used by the Diff writer to size the payload section.
+fn count_dirty_pages(bitmap: &[u64], num_pages: u64) -> u64 {
+    let mut count: u64 = 0;
+    for (word_idx, word) in bitmap.iter().enumerate() {
+        let start_bit = word_idx as u64 * 64;
+        if start_bit >= num_pages {
+            break;
+        }
+        let bits_in_word = (num_pages - start_bit).min(64);
+        let mask = if bits_in_word == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits_in_word) - 1
+        };
+        count += (word & mask).count_ones() as u64;
+    }
+    count
+}
+
 /// Write a Golden snapshot. Self-contained: header → vCPU state →
 /// region descriptors with payload offsets → VM/legacy/virtio-net
 /// state → full region payloads → trailer. See [`write_snapshot`] for
@@ -246,7 +307,7 @@ fn write_golden_snapshot(
     legacy_state: &LegacyDeviceState,
     virtio_net_state: &VirtioNetState,
     regions: &[MemoryRegionDescriptor],
-    mut region_payload: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
+    region_payload: &mut dyn FnMut(usize, &mut dyn Write) -> io::Result<()>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
     let mem_size: u64 = regions.iter().map(|r| r.size).sum();
     let metadata = SnapshotMetadata {
@@ -375,24 +436,56 @@ fn write_golden_snapshot(
     Ok(metadata)
 }
 
-/// Write a Diff snapshot — Phase 1 of audit I-004.
+/// Write a Diff snapshot (audit I-004 Phase 2).
 ///
-/// Phase 1 emits a well-formed Diff blob with an **empty** dirty set:
-/// the per-region bitmap is zero-filled and there are no dirty-page
-/// payloads. The parent golden file is hashed at write time and the
-/// SHA-256 stamped into the header so restore (Phase 2) can verify it
-/// has the right base.
+/// Per region, emits:
+///
+/// 1. The KVM dirty-page bitmap (`dirty_bitmap_bytes_for_region(size)`
+///    bytes, padded to a 4 KiB boundary).
+/// 2. The concatenated 4 KiB payloads of every page whose bit is set,
+///    in increasing-page-index scan order.
 ///
 /// vCPU / VM-level / legacy / virtio-net state are captured in full,
-/// same as Golden (audit I-004 §4 Q10).
-fn write_diff_snapshot_phase1(
+/// same as Golden (audit I-004 §4 Q10). The parent golden file is
+/// hashed at write time and the SHA-256 stamped into the header so
+/// restore can verify it has the right base.
+///
+/// `bitmaps[i]` must be exactly the bitmap returned by
+/// `KVM_GET_DIRTY_LOG` for the slot covering `regions[i]`. The writer
+/// re-validates that the slice length matches
+/// `dirty_bitmap_bytes_for_region(regions[i].size) / 8`.
+fn write_diff_snapshot(
     cfg: &SnapshotConfig,
     vcpu_states: &[VcpuStateData],
     vm_state: &VmStateData,
     legacy_state: &LegacyDeviceState,
     virtio_net_state: &VirtioNetState,
     regions: &[MemoryRegionDescriptor],
+    bitmaps: &[Vec<u64>],
+    read_page: &mut dyn FnMut(usize, u64) -> io::Result<Vec<u8>>,
 ) -> Result<SnapshotMetadata, SnapshotError> {
+    if bitmaps.len() != regions.len() {
+        return Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Diff snapshot bitmaps.len()={} != regions.len()={}",
+                bitmaps.len(),
+                regions.len()
+            ),
+        )));
+    }
+    for (i, r) in regions.iter().enumerate() {
+        let expected_words = (dirty_bitmap_bytes_for_region(r.size) / 8) as usize;
+        if bitmaps[i].len() != expected_words {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Diff bitmap for region {i} has {} u64 words; expected {expected_words}",
+                    bitmaps[i].len(),
+                ),
+            )));
+        }
+    }
     let parent_path = cfg.parent_golden_path.as_ref().ok_or_else(|| {
         SnapshotError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -443,16 +536,24 @@ fn write_diff_snapshot_phase1(
     let payloads_start = align_up(header_len, SNAPSHOT_PAGE_SIZE);
     let header_pad = (payloads_start - header_len) as usize;
 
-    // Each region's `file_offset` points to its dirty-bitmap section.
-    // Bitmap is page-aligned (so a Phase 2 mmap-overlay could in
-    // principle access it directly). Phase 1 has no payload after the
-    // bitmap; the next region's bitmap (or the trailer) follows.
+    // Per-region layout for Diff bodies:
+    //   [bitmap_bytes_padded_to_4KiB] [popcount * 4096 payload bytes]
+    // Total per region is already 4 KiB aligned because each payload
+    // page is 4 KiB. `file_offset` points to the bitmap start.
     let mut region_offsets: Vec<u64> = Vec::with_capacity(regions.len());
+    let mut region_popcounts: Vec<u64> = Vec::with_capacity(regions.len());
     let mut cursor = payloads_start;
-    for r in regions {
+    for (i, r) in regions.iter().enumerate() {
         region_offsets.push(cursor);
         let bitmap_bytes = dirty_bitmap_bytes_for_region(r.size);
-        cursor = align_up(cursor + bitmap_bytes, SNAPSHOT_PAGE_SIZE);
+        let bitmap_padded = align_up(bitmap_bytes, SNAPSHOT_PAGE_SIZE);
+        // Count set bits, but ignore any tail bits past the region's
+        // actual page count (KVM should zero them, but we mask anyway).
+        let num_pages = r.size.div_ceil(SNAPSHOT_PAGE_SIZE);
+        let pop = count_dirty_pages(&bitmaps[i], num_pages);
+        region_popcounts.push(pop);
+        cursor = bitmap_padded + pop * SNAPSHOT_PAGE_SIZE;
+        // payload section ends 4 KiB aligned by construction; no extra pad.
     }
 
     let file = File::create(&cfg.snapshot_path)?;
@@ -498,14 +599,60 @@ fn write_diff_snapshot_phase1(
     write_len_prefixed(&mut w, &virtio_net_bytes)?;
     write_zero_pad(&mut w, header_pad)?;
 
-    // Per-region dirty bitmaps. Phase 1: all zero. Phase 2 will write
-    // the bits from `KVM_GET_DIRTY_LOG` and append the concatenated
-    // dirty-page payloads after each bitmap.
-    for r in regions {
+    // Per-region dirty bitmaps + payloads.
+    for (i, r) in regions.iter().enumerate() {
+        // 1. Bitmap: write the u64 words as little-endian bytes, then
+        //    zero-pad to the next 4 KiB boundary.
         let bitmap_bytes = dirty_bitmap_bytes_for_region(r.size) as usize;
-        write_zero_pad(&mut w, bitmap_bytes)?;
-        let pad = (align_up(bitmap_bytes as u64, SNAPSHOT_PAGE_SIZE) - bitmap_bytes as u64) as usize;
-        write_zero_pad(&mut w, pad)?;
+        let words_expected = bitmap_bytes / 8;
+        debug_assert_eq!(bitmaps[i].len(), words_expected);
+        for word in &bitmaps[i] {
+            w.write_all(&word.to_le_bytes())?;
+        }
+        let bitmap_pad = (align_up(bitmap_bytes as u64, SNAPSHOT_PAGE_SIZE)
+            - bitmap_bytes as u64) as usize;
+        write_zero_pad(&mut w, bitmap_pad)?;
+
+        // 2. Payloads: walk the bitmap in scan order, call read_page for
+        //    each set bit. Mask out tail bits past the region's true
+        //    page count.
+        let num_pages = r.size.div_ceil(SNAPSHOT_PAGE_SIZE);
+        let mut emitted: u64 = 0;
+        let expected_pop = region_popcounts[i];
+        'word_loop: for (word_idx, word) in bitmaps[i].iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as u64;
+                let page_idx = word_idx as u64 * 64 + bit;
+                if page_idx >= num_pages {
+                    break 'word_loop;
+                }
+                let page = read_page(i, page_idx)?;
+                if page.len() != SNAPSHOT_PAGE_SIZE as usize {
+                    return Err(SnapshotError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "read_page(region={i}, page={page_idx}) returned \
+                             {} bytes; expected 4096",
+                            page.len()
+                        ),
+                    )));
+                }
+                w.write_all(&page)?;
+                emitted += 1;
+                bits &= bits - 1;
+            }
+        }
+        if emitted != expected_pop {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "diff writer emitted {emitted} pages for region {i}; \
+                     expected popcount {expected_pop}"
+                ),
+            )));
+        }
+        // payload section is `emitted * 4096` bytes — already 4 KiB aligned.
     }
 
     w.write_all(&MAGIC_TRAILER)?;
@@ -590,6 +737,9 @@ mod tests {
 
         // Write a Golden snapshot with a single 4 KiB region of zeros.
         let golden_cfg = SnapshotConfig::golden(golden_path.clone());
+        let mut zeros = |_idx: usize, w: &mut dyn Write| -> io::Result<()> {
+            w.write_all(&[0u8; 4096])
+        };
         let golden_meta = write_snapshot(
             &golden_cfg,
             &vcpus,
@@ -597,18 +747,20 @@ mod tests {
             &legacy_state,
             &virtio_net_state,
             &regions,
-            |_idx, w| {
-                w.write_all(&[0u8; 4096])?;
-                Ok(())
-            },
+            SnapshotSource::Golden(&mut zeros),
         )
         .expect("golden write");
         assert_eq!(golden_meta.kind, SnapshotKind::Golden);
         assert_eq!(golden_meta.parent_sha256, [0u8; 32]);
         let expected_parent_hash = hash_file_sha256(&golden_path).unwrap();
 
-        // Write a Diff snapshot against the golden file.
+        // Write a Diff snapshot against the golden file with an empty
+        // dirty set (zero-filled bitmap, no payload pages).
         let diff_cfg = SnapshotConfig::diff(diff_path.clone(), golden_path.clone());
+        let empty_bitmap: Vec<Vec<u64>> = vec![vec![0u64; 1]]; // 1 word covers a 4 KiB region
+        let mut never_read = |_idx: usize, _page: u64| -> io::Result<Vec<u8>> {
+            unreachable!("empty dirty set should not invoke read_page")
+        };
         let diff_meta = write_snapshot(
             &diff_cfg,
             &vcpus,
@@ -616,7 +768,10 @@ mod tests {
             &legacy_state,
             &virtio_net_state,
             &regions,
-            |_idx, _w| Ok(()), // ignored for Diff
+            SnapshotSource::Diff {
+                bitmaps: &empty_bitmap,
+                read_page: &mut never_read,
+            },
         )
         .expect("diff write");
         assert_eq!(diff_meta.kind, SnapshotKind::Diff);
@@ -633,6 +788,98 @@ mod tests {
         assert_eq!(diff_reader.parent_sha256, expected_parent_hash);
         assert_eq!(diff_reader.format_version, SNAPSHOT_FORMAT_VERSION);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit I-004 Phase 2: writing a Diff snapshot with non-zero
+    /// dirty pages produces a well-formed file. The reader exposes the
+    /// bitmap and lets callers fetch each dirty page back by index.
+    #[test]
+    fn diff_snapshot_round_trips_dirty_pages() {
+        let dir = temp_dir().join(format!("ateom-i004-phase2-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let golden_path = dir.join("golden.snap");
+        let diff_path = dir.join("diff.snap");
+
+        let vcpus = vec![VcpuStateData::default()];
+        let vm_state = VmStateData::default();
+        let legacy_state = LegacyDeviceState::default();
+        let virtio_net_state = VirtioNetState::default();
+        // 8 pages = 32 KiB region (1 bitmap word).
+        let region_size: u64 = 8 * SNAPSHOT_PAGE_SIZE;
+        let regions = vec![MemoryRegionDescriptor {
+            guest_phys_addr: 0,
+            size: region_size,
+        }];
+
+        // Write a Golden snapshot.
+        let golden_cfg = SnapshotConfig::golden(golden_path.clone());
+        let mut g_writer = |_idx: usize, w: &mut dyn Write| -> io::Result<()> {
+            w.write_all(&vec![0u8; region_size as usize])
+        };
+        write_snapshot(
+            &golden_cfg,
+            &vcpus,
+            &vm_state,
+            &legacy_state,
+            &virtio_net_state,
+            &regions,
+            SnapshotSource::Golden(&mut g_writer),
+        )
+        .expect("golden write");
+
+        // Build a "dirty" bitmap: pages 1, 3, 5 set (popcount = 3).
+        let bitmap: Vec<Vec<u64>> = vec![vec![(1u64 << 1) | (1u64 << 3) | (1u64 << 5)]];
+
+        // read_page returns a recognisable pattern based on (region, page).
+        let mut read_page_fn = |region_idx: usize, page_idx: u64| -> io::Result<Vec<u8>> {
+            let mut v = vec![0u8; SNAPSHOT_PAGE_SIZE as usize];
+            let stamp = ((region_idx as u32) << 16) | (page_idx as u32);
+            for chunk in v.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&stamp.to_le_bytes());
+            }
+            Ok(v)
+        };
+
+        let diff_cfg = SnapshotConfig::diff(diff_path.clone(), golden_path.clone());
+        write_snapshot(
+            &diff_cfg,
+            &vcpus,
+            &vm_state,
+            &legacy_state,
+            &virtio_net_state,
+            &regions,
+            SnapshotSource::Diff {
+                bitmaps: &bitmap,
+                read_page: &mut read_page_fn,
+            },
+        )
+        .expect("diff write");
+
+        let mut diff_reader = SnapshotReader::open(&diff_path).expect("open diff");
+        assert_eq!(diff_reader.kind, SnapshotKind::Diff);
+        assert_eq!(diff_reader.bitmaps.len(), 1);
+        assert_eq!(diff_reader.bitmaps[0], bitmap[0]);
+
+        // Fetch each dirty page back and verify the pattern.
+        for page_idx in [1u64, 3, 5] {
+            let bytes = diff_reader
+                .read_dirty_page(0, page_idx)
+                .expect("read_dirty_page");
+            assert_eq!(bytes.len(), SNAPSHOT_PAGE_SIZE as usize);
+            let stamp = page_idx as u32; // region_idx=0
+            let mut expected = vec![0u8; SNAPSHOT_PAGE_SIZE as usize];
+            for chunk in expected.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&stamp.to_le_bytes());
+            }
+            assert_eq!(bytes, expected, "page {page_idx}");
+        }
+
+        // Asking for a clean page should fail.
+        assert!(diff_reader.read_dirty_page(0, 0).is_err());
+        assert!(diff_reader.read_dirty_page(0, 2).is_err());
+
+        diff_reader.check_trailer().expect("trailer");
         let _ = fs::remove_dir_all(&dir);
     }
 }
