@@ -494,6 +494,23 @@ impl VirtioNetDeviceMgr {
                     continue;
                 }
             }
+            // Negative-control hook (audit I-003 Phase 3 step 5):
+            // when `ATEOM_NEG_SKIP_NET_RESTORE_ACTIVATE=1` is set, skip
+            // the `restore_activate` call so the device's queue cursors
+            // and acked_features are restored but no per-device epoll
+            // handler is bound to the TAP. This reproduces the failure
+            // mode that motivated PR #4 (kernel TX queue hangs, NETDEV
+            // WATCHDOG) and lets the round-trip test prove it catches
+            // the regression. Off by default; runtime-only knob (no
+            // rebuild required to flip between positive and negative).
+            if std::env::var_os("ATEOM_NEG_SKIP_NET_RESTORE_ACTIVATE").is_some() {
+                slog::warn!(
+                    logger,
+                    "virtio-net restore: NEGATIVE CONTROL — skipping restore_activate";
+                    "iface_id" => &captured.iface_id,
+                );
+                continue;
+            }
             if let Err(e) = mmio_dev.restore_activate() {
                 slog::error!(
                     logger,
