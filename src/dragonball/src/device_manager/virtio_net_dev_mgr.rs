@@ -318,50 +318,97 @@ impl VirtioNetDeviceMgr {
         }
     }
 
-    /// Capture per-device interface spec for snapshot (planning-repo
-    /// audit I-003, Phase 1).
+    /// Capture per-device state for snapshot (planning-repo audit
+    /// I-003, Phase 2).
     ///
-    /// Reads from each device's `VirtioNetDeviceConfigInfo` only —
-    /// queue cursors, ring GPAs, and negotiated features are NOT
-    /// captured yet. Those land in Phase 2 by clone-sharing the
-    /// `QueueSync` Arc from `Net::activate` and reading from a Net
-    /// downcast (the per-device epoll handler privately owns the live
-    /// queues today, so the cursors are not reachable via a `&Net`
-    /// downcast alone).
+    /// Phase 1 fields (`iface_id`, `host_dev_name`, `guest_mac`,
+    /// `num_queues`, `queue_size`) come from each device's declarative
+    /// `VirtioNetDeviceConfigInfo`. Phase 2 fields (`acked_features`,
+    /// per-queue cursors + ring GPAs + ready/event_idx) are read out
+    /// of the live `MmioV2DeviceState` — the same path
+    /// `update_device_ratelimiters` uses to reach the inner `Net`.
+    /// `MmioV2DeviceState::queues` is clone-shared with the per-device
+    /// epoll handler installed at `Net::activate` time (ADR-0003), so
+    /// the cursors visible here are the live ones.
+    ///
+    /// If a device has not yet been activated by the guest driver
+    /// (no MMIO `DEVICE_DRIVER_OK` write yet) the captured `queues`
+    /// vector is empty and `acked_features` is 0; the restore path
+    /// then skips `restore_activate` for that device.
     pub fn snapshot_devices(&self) -> crate::snapshot::virtio_net_state::VirtioNetState {
+        use crate::snapshot::virtio_net_state::{QueueState, VirtioNetDeviceState, VirtioNetState};
+
         let devices = self
             .info_list
             .iter()
-            .map(|info| crate::snapshot::virtio_net_state::VirtioNetDeviceState {
-                iface_id: info.config.iface_id.clone(),
-                host_dev_name: info.config.host_dev_name.clone(),
-                guest_mac: info.config.guest_mac.as_ref().map(|m| {
+            .map(|info| {
+                let guest_mac = info.config.guest_mac.as_ref().map(|m| {
                     let bytes = m.get_bytes();
                     let mut out = [0u8; 6];
                     out.copy_from_slice(&bytes[..6]);
                     out
-                }),
-                num_queues: info.config.queue_sizes().len() as u8,
-                queue_size: {
-                    let qs = info.config.queue_sizes();
-                    qs.first().copied().unwrap_or(DEFAULT_QUEUE_SIZE)
-                },
+                });
+                let (acked_features, queues) = info
+                    .device
+                    .as_ref()
+                    .and_then(|d| d.as_any().downcast_ref::<DbsMmioV2Device>())
+                    .map(|mmio_dev| {
+                        let guard = mmio_dev.state();
+                        let q_states: Vec<QueueState> = guard
+                            .snapshot_queue_states()
+                            .into_iter()
+                            .map(|qs| QueueState {
+                                index: qs.index,
+                                size: qs.size,
+                                ready: qs.ready,
+                                event_idx_enabled: qs.event_idx_enabled,
+                                next_avail: qs.next_avail,
+                                next_used: qs.next_used,
+                                desc_table: qs.desc_table,
+                                avail_ring: qs.avail_ring,
+                                used_ring: qs.used_ring,
+                            })
+                            .collect();
+                        let acked = guard
+                            .get_inner_device()
+                            .as_any()
+                            .downcast_ref::<Net<GuestAddressSpaceImpl>>()
+                            .map(|net| net.acked_features())
+                            .unwrap_or(0);
+                        (acked, q_states)
+                    })
+                    .unwrap_or((0, Vec::new()));
+                VirtioNetDeviceState {
+                    iface_id: info.config.iface_id.clone(),
+                    host_dev_name: info.config.host_dev_name.clone(),
+                    guest_mac,
+                    num_queues: info.config.queue_sizes().len() as u8,
+                    queue_size: {
+                        let qs = info.config.queue_sizes();
+                        qs.first().copied().unwrap_or(DEFAULT_QUEUE_SIZE)
+                    },
+                    acked_features,
+                    queues,
+                }
             })
             .collect();
-        crate::snapshot::virtio_net_state::VirtioNetState { devices }
+        VirtioNetState { devices }
     }
 
-    /// Apply a captured virtio-net state envelope on restore (Phase 1).
+    /// Apply a captured virtio-net state envelope on restore (Phase 2).
     ///
-    /// Phase 1: this is effectively a sanity check — the iface spec in
-    /// the captured envelope is already determined by the VM's
-    /// declarative config and re-applied during device construction.
-    /// We verify the captured set matches what we built and log a
-    /// warning if iface_ids drift; we do not attempt to repair
-    /// mismatches because the substrate-side `Vmm::restore` is
-    /// responsible for boot-with-matching-config. Phase 2 will
-    /// additionally push live queue cursors back into each `Net` via
-    /// the `QueueSync` setters.
+    /// For each captured device, match by `iface_id`, then push the
+    /// snapshot's `acked_features` + per-queue cursors back into the
+    /// live `MmioV2DeviceState`/`Net`, and synthesize a device
+    /// activation via `MmioV2Device::restore_activate`. This re-creates
+    /// the per-device epoll handler and re-binds it to the TAP fd
+    /// without requiring the guest driver to re-issue any MMIO writes
+    /// (which it would not do on restore — the guest's view is that
+    /// the device is already activated).
+    ///
+    /// Devices captured with an empty `queues` vector (never activated
+    /// pre-snapshot) are skipped — their natural code path will run
+    /// when the guest eventually writes `DEVICE_DRIVER_OK`.
     pub fn restore_devices(
         &mut self,
         state: &crate::snapshot::virtio_net_state::VirtioNetState,
@@ -377,14 +424,106 @@ impl VirtioNetDeviceMgr {
             return;
         }
         for (idx, captured) in state.devices.iter().enumerate() {
-            let cur = &self.info_list[idx].config;
-            if cur.iface_id != captured.iface_id {
+            let info = &mut self.info_list[idx];
+            if info.config.iface_id != captured.iface_id {
                 slog::warn!(
                     logger,
                     "virtio-net restore: iface_id drift at index";
                     "index" => idx,
                     "snapshot" => &captured.iface_id,
-                    "current" => &cur.iface_id,
+                    "current" => &info.config.iface_id,
+                );
+                continue;
+            }
+            if captured.queues.is_empty() {
+                slog::info!(
+                    logger,
+                    "virtio-net restore: device not activated pre-snapshot, skipping";
+                    "iface_id" => &captured.iface_id,
+                );
+                continue;
+            }
+            let Some(device) = info.device.as_ref() else {
+                slog::warn!(
+                    logger,
+                    "virtio-net restore: device handle missing";
+                    "iface_id" => &captured.iface_id,
+                );
+                continue;
+            };
+            let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() else {
+                slog::warn!(
+                    logger,
+                    "virtio-net restore: device is not an MMIO v2 device";
+                    "iface_id" => &captured.iface_id,
+                );
+                continue;
+            };
+            // Build the dbs-side queue state vector from the captured
+            // snapshot fields (mirror-shape; trivial field-by-field copy).
+            let q_states: Vec<virtio::mmio::QueueSnapshotState> = captured
+                .queues
+                .iter()
+                .map(|qs| virtio::mmio::QueueSnapshotState {
+                    index: qs.index,
+                    size: qs.size,
+                    ready: qs.ready,
+                    event_idx_enabled: qs.event_idx_enabled,
+                    next_avail: qs.next_avail,
+                    next_used: qs.next_used,
+                    desc_table: qs.desc_table,
+                    avail_ring: qs.avail_ring,
+                    used_ring: qs.used_ring,
+                })
+                .collect();
+            {
+                let mut guard = mmio_dev.state();
+                guard.apply_queue_snapshot_states(&q_states);
+                if let Some(net) = guard
+                    .get_inner_device_mut()
+                    .as_any_mut()
+                    .downcast_mut::<Net<GuestAddressSpaceImpl>>()
+                {
+                    net.set_acked_features_full(captured.acked_features);
+                } else {
+                    slog::warn!(
+                        logger,
+                        "virtio-net restore: inner device is not Net";
+                        "iface_id" => &captured.iface_id,
+                    );
+                    continue;
+                }
+            }
+            // Negative-control hook (audit I-003 Phase 3 step 5):
+            // when `ATEOM_NEG_SKIP_NET_RESTORE_ACTIVATE=1` is set, skip
+            // the `restore_activate` call so the device's queue cursors
+            // and acked_features are restored but no per-device epoll
+            // handler is bound to the TAP. This reproduces the failure
+            // mode that motivated PR #4 (kernel TX queue hangs, NETDEV
+            // WATCHDOG) and lets the round-trip test prove it catches
+            // the regression. Off by default; runtime-only knob (no
+            // rebuild required to flip between positive and negative).
+            if std::env::var_os("ATEOM_NEG_SKIP_NET_RESTORE_ACTIVATE").is_some() {
+                slog::warn!(
+                    logger,
+                    "virtio-net restore: NEGATIVE CONTROL — skipping restore_activate";
+                    "iface_id" => &captured.iface_id,
+                );
+                continue;
+            }
+            if let Err(e) = mmio_dev.restore_activate() {
+                slog::error!(
+                    logger,
+                    "virtio-net restore: restore_activate failed";
+                    "iface_id" => &captured.iface_id,
+                    "error" => format!("{:?}", e),
+                );
+            } else {
+                slog::info!(
+                    logger,
+                    "virtio-net restore: device reactivated";
+                    "iface_id" => &captured.iface_id,
+                    "queues" => captured.queues.len(),
                 );
             }
         }

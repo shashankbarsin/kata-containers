@@ -41,6 +41,9 @@ seccompiler = { workspace = true }
 serde = "1.0.27"
 serde_derive = "1.0.27"
 serde_json = "1.0.9"
+# ATEOM POC (I-004 Phase 1): SHA-256 of the parent golden so a diff
+# snapshot can verify on restore that the right base is being applied.
+sha2 = "0.10"
 slog = "2.5.2"
 slog-scope = "4.4.0"
 thiserror = "1"

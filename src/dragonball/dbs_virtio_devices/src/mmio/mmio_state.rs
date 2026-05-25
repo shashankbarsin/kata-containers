@@ -24,6 +24,40 @@ use crate::{
     VirtioQueueConfig, VirtioSharedMemory, VirtioSharedMemoryList, DEVICE_DRIVER_OK, DEVICE_FAILED,
 };
 
+/// Per-virtqueue state captured at snapshot time and applied during
+/// restore (planning-repo audit I-003 Phase 2).
+///
+/// Sufficient to reconstruct an active queue's view of its rings and
+/// cursors after a snapshot/restore cycle: the `MmioV2DeviceState::
+/// snapshot_queue_states` / `apply_queue_snapshot_states` pair round-
+/// trips this struct through the device's `VirtioQueueConfig<Q>`. For
+/// `Q = QueueSync` the queue is `Arc<Mutex<Queue>>` and clones share
+/// state, so the snapshot reads coherent cursors from the same memory
+/// the device's epoll handler is actively updating.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QueueSnapshotState {
+    /// Index of the queue inside the device's `queues` vector
+    /// (queue-select index from the virtio MMIO spec).
+    pub index: u16,
+    /// Actual queue size negotiated by the driver (descriptors).
+    pub size: u16,
+    /// Whether the driver has marked the queue as ready (i.e. the
+    /// guest finished writing ring GPAs and is using the queue).
+    pub ready: bool,
+    /// VIRTIO_F_EVENT_IDX was successfully negotiated for this queue.
+    pub event_idx_enabled: bool,
+    /// Next descriptor index the host will read from the avail ring.
+    pub next_avail: u16,
+    /// Next descriptor index the host will write to the used ring.
+    pub next_used: u16,
+    /// Guest physical address of the descriptor table.
+    pub desc_table: u64,
+    /// Guest physical address of the avail ring.
+    pub avail_ring: u64,
+    /// Guest physical address of the used ring.
+    pub used_ring: u64,
+}
+
 /// The state of Virtio Mmio device.
 pub struct MmioV2DeviceState<AS: GuestAddressSpace + Clone, Q: QueueT, R: GuestMemoryRegion> {
     device: Box<dyn VirtioDevice<AS, Q, R>>,
@@ -265,6 +299,65 @@ where
     #[allow(dead_code)]
     pub(crate) fn queues_mut(&mut self) -> &mut Vec<VirtioQueueConfig<Q>> {
         &mut self.queues
+    }
+
+    /// Capture per-queue snapshot state for every queue owned by this
+    /// MMIO transport (planning-repo audit I-003 Phase 2).
+    ///
+    /// `MmioV2DeviceState::create_queue_config` clones `VirtioQueueConfig<Q>`
+    /// into the `VirtioDeviceConfig` handed to `device.activate(...)`.
+    /// For `QueueSync` (`Arc<Mutex<Queue>>`), that clone shares state
+    /// with the post-activate copy owned by the device's epoll handler,
+    /// so the cursors visible through `self.queues` are coherent live
+    /// cursors as long as the caller has paused/quiesced the device
+    /// epoll thread before snapshotting.
+    pub fn snapshot_queue_states(&self) -> Vec<QueueSnapshotState> {
+        self.queues
+            .iter()
+            .map(|qc| QueueSnapshotState {
+                index: qc.index(),
+                size: qc.queue.size(),
+                ready: qc.queue.ready(),
+                event_idx_enabled: qc.queue.event_idx_enabled(),
+                next_avail: qc.queue.next_avail(),
+                next_used: qc.queue.next_used(),
+                desc_table: qc.queue.desc_table(),
+                avail_ring: qc.queue.avail_ring(),
+                used_ring: qc.queue.used_ring(),
+            })
+            .collect()
+    }
+
+    /// Re-apply a captured per-queue state to `self.queues`. MUST be
+    /// called BEFORE `activate()` so that `create_device_config`'s
+    /// queue-config clones carry the restored cursors / ring GPAs into
+    /// the device's epoll handler.
+    ///
+    /// Matches states to queues by `index` rather than position. Missing
+    /// states are ignored (queue keeps its zero-initialized cursors);
+    /// extra states (index beyond known queues) are ignored.
+    pub fn apply_queue_snapshot_states(&mut self, states: &[QueueSnapshotState]) {
+        for s in states {
+            if let Some(qc) = self.queues.iter_mut().find(|q| q.index() == s.index) {
+                qc.queue.set_size(s.size);
+                qc.queue
+                    .set_desc_table_address(Some(s.desc_table as u32), None);
+                qc.queue
+                    .set_desc_table_address(None, Some((s.desc_table >> 32) as u32));
+                qc.queue
+                    .set_avail_ring_address(Some(s.avail_ring as u32), None);
+                qc.queue
+                    .set_avail_ring_address(None, Some((s.avail_ring >> 32) as u32));
+                qc.queue
+                    .set_used_ring_address(Some(s.used_ring as u32), None);
+                qc.queue
+                    .set_used_ring_address(None, Some((s.used_ring >> 32) as u32));
+                qc.queue.set_event_idx(s.event_idx_enabled);
+                qc.queue.set_next_avail(s.next_avail);
+                qc.queue.set_next_used(s.next_used);
+                qc.queue.set_ready(s.ready);
+            }
+        }
     }
 
     #[inline]

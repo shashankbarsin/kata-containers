@@ -12,6 +12,17 @@
 //! just hands back the raw `Vec<u64>` returned by `kvm-ioctls`. Bit `n` is set
 //! if page `n` (4 KiB) of the slot has been written since the last reset of
 //! the log.
+//!
+//! ## Lifecycle (I-004 §4 Q5)
+//!
+//! `KVM_GET_DIRTY_LOG` clears the bitmap as a side-effect of returning it
+//! (kvm-ioctls docs: "As a side-effect, this also resets the bitmap inside
+//! the kernel"). The `KVM_CLEAR_DIRTY_LOG` ioctl is **not exposed** by
+//! kvm-ioctls 0.24.0 — only `KVM_GET_DIRTY_LOG` is. We therefore rely on
+//! the implicit reset: a diff snapshot calls `get_dirty_log`, walks the
+//! returned bitmap to write dirty pages, and the next diff will see only
+//! pages dirtied after this call returns. This matches the
+//! "GET → write → implicit CLEAR" semantics described in audit I-004 §4 Q5.
 
 use kvm_ioctls::VmFd;
 
@@ -35,6 +46,9 @@ pub enum DirtyTrackerError {
 ///
 /// `memory_size_bytes` must match the size that was passed to
 /// `KVM_SET_USER_MEMORY_REGION` for this slot.
+///
+/// This call has the side-effect of clearing the in-kernel bitmap — see
+/// the module docs.
 pub fn get_dirty_log(
     vm_fd: &VmFd,
     slot: u32,
